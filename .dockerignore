@@ -1,0 +1,15 @@
+.git
+.github
+build
+data
+uploads
+backups
+tests
+docs
+*.md
+!docs/API.md
+.gitignore
+.env
+.env.*
+*.log
+dist

@@ -1,0 +1,183 @@
+name: linux-musl
+
+on:
+  push:
+    branches: [main, develop]
+    tags: ["v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential musl-tools file binutils python3
+      - name: 构建与测试
+        run: |
+          make dev
+          make test
+      - name: 前端静态检查
+        run: python3 scripts/check_frontend.py
+
+  build-linux-musl-amd64:
+    name: build-linux-musl-amd64
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 musl 工具链
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential musl-tools file binutils
+      - name: 构建 amd64 静态二进制
+        run: |
+          make static
+          mkdir -p dist/linux-amd64-musl
+          cp build/RoomCheck dist/linux-amd64-musl/RoomCheck
+          ./scripts/verify-static.sh dist/linux-amd64-musl/RoomCheck amd64 --run
+          sha256sum dist/linux-amd64-musl/RoomCheck | tee dist/linux-amd64-musl/RoomCheck.sha256
+      - name: 上传 amd64 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: roomcheck-musl-amd64
+          path: dist/linux-amd64-musl
+          if-no-files-found: error
+
+  build-linux-musl-arm64:
+    name: build-linux-musl-arm64
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: 在 arm64 musl 容器中构建并自检
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD":/src -w /src \
+            alpine:3.20 sh -euxc '
+              apk add --no-cache build-base make file binutils &&
+              make clean &&
+              make CC=gcc LDFLAGS="-static -s -no-pie" build/RoomCheck &&
+              file build/RoomCheck &&
+              ! readelf -l build/RoomCheck | grep -q INTERP &&
+              ! readelf -d build/RoomCheck | grep -q NEEDED &&
+              ./build/RoomCheck --version &&
+              ./build/RoomCheck --selftest &&
+              mkdir -p dist/linux-arm64-musl &&
+              cp build/RoomCheck dist/linux-arm64-musl/RoomCheck &&
+              sha256sum dist/linux-arm64-musl/RoomCheck > dist/linux-arm64-musl/RoomCheck.sha256
+            '
+      - name: 宿主侧校验 ELF 架构与静态链接
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y file binutils
+          file dist/linux-arm64-musl/RoomCheck
+          readelf -h dist/linux-arm64-musl/RoomCheck | grep -q "AArch64"
+          ! readelf -l dist/linux-arm64-musl/RoomCheck | grep -q INTERP
+          ! readelf -d dist/linux-arm64-musl/RoomCheck | grep -q NEEDED
+          sha256sum -c dist/linux-arm64-musl/RoomCheck.sha256
+      - name: 上传 arm64 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: roomcheck-musl-arm64
+          path: dist/linux-arm64-musl
+          if-no-files-found: error
+
+  release-artifacts:
+    name: release-artifacts
+    needs: [build-linux-musl-amd64, build-linux-musl-arm64]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: roomcheck-musl-*
+          path: dist
+          merge-multiple: true
+      - name: 安装校验工具
+        run: sudo apt-get update && sudo apt-get install -y file binutils
+      - name: 规范化产物目录
+        run: |
+          set -euo pipefail
+          ls -lR dist
+          mkdir -p dist/linux-amd64-musl dist/linux-arm64-musl
+          for f in $(find dist -type f -name RoomCheck); do
+            if file "$f" | grep -q "x86-64"; then
+              cp "$f" dist/linux-amd64-musl/RoomCheck
+            elif file "$f" | grep -q "aarch64"; then
+              cp "$f" dist/linux-arm64-musl/RoomCheck
+            fi
+          done
+          test -f dist/linux-amd64-musl/RoomCheck
+          test -f dist/linux-arm64-musl/RoomCheck
+      - name: 生成校验和与构建信息
+        run: |
+          set -euo pipefail
+          sha256sum dist/linux-amd64-musl/RoomCheck dist/linux-arm64-musl/RoomCheck > dist/SHA256SUMS
+          {
+            echo "RoomCheck Linux musl static build"
+            echo "commit: ${GITHUB_SHA}"
+            echo "ref: ${GITHUB_REF}"
+            echo "run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "built_at_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "sqlite: 3.46.1 (amalgamation)"
+            echo "architectures: amd64, arm64"
+            echo "linking: fully static musl"
+            for f in dist/linux-amd64-musl/RoomCheck dist/linux-arm64-musl/RoomCheck; do
+              echo "artifact: $f"
+              echo "  sha256: $(sha256sum "$f" | awk '{print $1}')"
+              echo "  size: $(stat -c%s "$f")"
+              file "$f"
+            done
+          } > dist/build-info.txt
+          cat dist/SHA256SUMS
+          cat dist/build-info.txt
+      - name: 上传合并产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: roomcheck-linux-musl-static
+          path: dist
+          if-no-files-found: error
+      - name: 创建 GitHub Release（仅版本 Tag）
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/linux-amd64-musl/RoomCheck \
+            dist/linux-arm64-musl/RoomCheck \
+            dist/SHA256SUMS \
+            dist/build-info.txt \
+            --title "RoomCheck ${GITHUB_REF_NAME}" \
+            --generate-notes \
+          || gh release upload "${GITHUB_REF_NAME}" \
+            dist/linux-amd64-musl/RoomCheck \
+            dist/linux-arm64-musl/RoomCheck \
+            dist/SHA256SUMS \
+            dist/build-info.txt --clobber
+
+  build-report:
+    name: build-report
+    needs: [build-linux-musl-amd64, build-linux-musl-arm64, release-artifacts]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 写入构建报告
+        run: |
+          echo "## RoomCheck Linux musl 静态构建报告" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Ref: \`$GITHUB_REF\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- amd64: \`${{ needs.build-linux-musl-amd64.result }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- arm64: \`${{ needs.build-linux-musl-arm64.result }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Release: \`${{ needs.release-artifacts.result }}\`" >> "$GITHUB_STEP_SUMMARY"

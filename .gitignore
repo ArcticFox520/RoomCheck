@@ -1,0 +1,14 @@
+build/
+dist/
+data/
+uploads/*
+backups/*
+!uploads/.gitkeep
+!backups/.gitkeep
+tests/__pycache__/
+__pycache__/
+*.pyc
+*.log
+.env
+.env.*
+.DS_Store

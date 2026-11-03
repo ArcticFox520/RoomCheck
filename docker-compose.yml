@@ -1,0 +1,36 @@
+services:
+  roomcheck:
+    image: arcticfox520/roomcheck:${ROOMCHECK_TAG:-1.0.0}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: roomcheck
+    restart: unless-stopped
+    ports:
+      - "${ROOMCHECK_PORT:-8080}:8080"
+    environment:
+      PORT: "8080"
+      ROOMCHECK_DATA_DIR: /data
+      ROOMCHECK_COOKIE_SECURE: "${ROOMCHECK_COOKIE_SECURE:-0}"
+      # 可选：首次初始化管理员密码；不设置则随机生成并输出到容器日志
+      ADMIN_INIT_PASSWORD: "${ADMIN_INIT_PASSWORD:-}"
+      # 设为 1 会在容器启动时重置管理员密码（不影响楼层长数据）
+      ADMIN_RESET: "${ADMIN_RESET:-0}"
+    volumes:
+      # 数据库、图片、备份统一保存在 /data 下，便于整体持久化与备份
+      - roomcheck-data:/data
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  roomcheck-data:
+    name: roomcheck-data
