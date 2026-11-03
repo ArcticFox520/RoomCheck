@@ -54,38 +54,20 @@ jobs:
   build-linux-musl-arm64:
     name: build-linux-musl-arm64
     needs: validate
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-      - name: 在 arm64 musl 容器中构建并自检
-        run: |
-          docker run --rm --platform linux/arm64 \
-            -v "$PWD":/src -w /src \
-            alpine:3.20 sh -euxc '
-              apk add --no-cache build-base make file binutils &&
-              make clean &&
-              make CC=gcc LDFLAGS="-static -s -no-pie" build/RoomCheck &&
-              file build/RoomCheck &&
-              ! readelf -l build/RoomCheck | grep -q INTERP &&
-              ! readelf -d build/RoomCheck | grep -q NEEDED &&
-              ./build/RoomCheck --version &&
-              ./build/RoomCheck --selftest &&
-              mkdir -p dist/linux-arm64-musl &&
-              cp build/RoomCheck dist/linux-arm64-musl/RoomCheck &&
-              sha256sum dist/linux-arm64-musl/RoomCheck > dist/linux-arm64-musl/RoomCheck.sha256
-            '
-      - name: 宿主侧校验 ELF 架构与静态链接
+      - name: 安装 musl 工具链
         run: |
           sudo apt-get update
-          sudo apt-get install -y file binutils
-          file dist/linux-arm64-musl/RoomCheck
-          readelf -h dist/linux-arm64-musl/RoomCheck | grep -q "AArch64"
-          ! readelf -l dist/linux-arm64-musl/RoomCheck | grep -q INTERP
-          ! readelf -d dist/linux-arm64-musl/RoomCheck | grep -q NEEDED
-          sha256sum -c dist/linux-arm64-musl/RoomCheck.sha256
+          sudo apt-get install -y build-essential musl-tools file binutils
+      - name: 构建 arm64 静态二进制
+        run: |
+          make static
+          mkdir -p dist/linux-arm64-musl
+          cp build/RoomCheck dist/linux-arm64-musl/RoomCheck
+          ./scripts/verify-static.sh dist/linux-arm64-musl/RoomCheck arm64 --run
+          sha256sum dist/linux-arm64-musl/RoomCheck | tee dist/linux-arm64-musl/RoomCheck.sha256
       - name: 上传 arm64 产物
         uses: actions/upload-artifact@v4
         with:
