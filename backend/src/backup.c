@@ -307,7 +307,8 @@ static int tar_header(strbuf_t *out, const char *name, char type, int64_t size, 
     unsigned char hdr[512];
     memset(hdr, 0, sizeof(hdr));
     memcpy(hdr, name, strlen(name));
-    tar_octal((char *)hdr + 100, 8, 0644);
+    int64_t mode = (type == '5') ? 0755 : 0644;
+    tar_octal((char *)hdr + 100, 8, mode);
     tar_octal((char *)hdr + 108, 8, 0);
     tar_octal((char *)hdr + 116, 8, 0);
     tar_octal((char *)hdr + 124, 12, size);
