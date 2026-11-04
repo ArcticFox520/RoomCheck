@@ -455,7 +455,7 @@ int week_build_json(request_t *r, int64_t account_id, jw_t *out, char *err, size
     jw_key(out, "iso_week");
     jw_int(out, week.iso_week);
     char label[64];
-    snprintf(label, sizeof(label), "%d 年第 %d 周", week.iso_year, week.iso_week);
+    rc_fmt_week_range(week.week_start, week.week_end, label, sizeof(label));
     jw_key(out, "label");
     jw_str(out, label);
     jw_key(out, "created_at");

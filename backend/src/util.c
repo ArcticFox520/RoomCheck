@@ -815,6 +815,22 @@ void rc_fmt_time(int64_t ts, char *out, size_t outsz)
     strftime(out, outsz, "%H:%M:%S", &tm);
 }
 
+void rc_fmt_month_day(int64_t ts, char *out, size_t outsz)
+{
+    time_t t = (time_t)(ts + 8 * 3600);
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    snprintf(out, outsz, "%d月%d日", tm.tm_mon + 1, tm.tm_mday);
+}
+
+void rc_fmt_week_range(int64_t week_start, int64_t week_end, char *out, size_t outsz)
+{
+    char start[32], end[32];
+    rc_fmt_month_day(week_start, start, sizeof(start));
+    rc_fmt_month_day(week_end, end, sizeof(end));
+    snprintf(out, outsz, "%s — %s", start, end);
+}
+
 int rc_weekday(int day_index)
 {
     /* day 0=Mon .. 6=Sun -> tm_wday 1..6,0 */

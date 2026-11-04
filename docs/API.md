@@ -13,9 +13,11 @@
   `X-CSRF-Token: <csrf_token>`
   `csrf_token` 由 `/api/login` 与 `/api/session` 返回，保存在前端内存/localStorage。
 - Session 有效期 7 天。`/api/logout` 后失效。
+- 角色：`super_admin`（超级管理员）、`admin`（管理员）、`floor_manager`（楼层长）。管理员接口接受 `admin` 与 `super_admin`；`/api/super-admin/*` 仅接受 `super_admin`；其余业务接口按账户归属校验。
 - 管理员首次登录 `must_change_password=true` 时，除下列接口外全部返回
   `403 password_change_required`：
   `GET /api/session`、`POST /api/password`、`POST /api/logout`、`GET /api/health`。
+- 超级管理员由系统初始化管理员迁移/创建；业务接口不提供创建超级管理员的入口。
 
 ### 1.2 响应格式
 
@@ -42,8 +44,8 @@
   "status": "enabled", "must_change_password": false, "created_at": 1762000000 }
 ```
 
-`role`: `admin` | `floor_manager`；`status`: `enabled` | `disabled` | `deleted`。
-管理员账户管理接口返回的账户对象同样包含 `role` 字段（值固定为 `floor_manager`）。
+`role`: `super_admin` | `admin` | `floor_manager`；`status`: `enabled` | `disabled` | `deleted`。
+管理员账户管理接口返回的账户对象同样包含 `role` 字段（`super_admin` 或 `admin`）；账户列表（`/api/admin/accounts`）只返回楼层长账户。
 
 **Progress**
 
@@ -93,7 +95,7 @@
 {
   "account": { /* User */ },
   "week": { "id": 7, "week_start": "2026-11-02", "week_end": "2026-11-08",
-            "iso_year": 2026, "iso_week": 45, "label": "2026 年第 45 周",
+            "iso_year": 2026, "iso_week": 45, "label": "11月2日 — 11月8日",
             "created_at": 1762000000, "plan_type": "initial" },
   "config": { /* Config，可为 null */ },
   "progress": { "checked": 3, "total": 30, "percent": 10, "completed": false },
@@ -103,17 +105,18 @@
 }
 ```
 
+`week_start` / `week_end`：`Asia/Shanghai` 时区的真实周起止日期（周一至周日），是周标题展示的唯一依据；`label` 为同样基于该两字段生成的日期范围文本，例如 `11月2日 — 11月8日`、`12月29日 — 1月4日`。`iso_year` / `iso_week` 仅保留周数据标识，不作为周标题展示。
 `next_group_id` / `next_room_id`：第一个未完成组的 id 与该组第一个未勾选寝室 id；全部完成时为 `null`。
 
 **AccountSummary**（管理员账户列表）
 
 ```json
-{ "id": 2, "username": "f1", "display_name": "一层", "status": "enabled",
+{ "id": 2, "role": "floor_manager", "username": "f1", "display_name": "一层", "status": "enabled",
   "deleted_at": null, "delete_at": null, "remaining_seconds": null,
   "remaining_text": null, "created_at": 1762000000, "last_login_at": 1762000000,
   "config": { /* Config 或 null */ },
   "progress": { /* Progress 或 null */ },
-  "week": { "week_start": "2026-11-02", "week_end": "2026-11-08", "label": "2026 年第 45 周" } }
+  "week": { "week_start": "2026-11-02", "week_end": "2026-11-08", "label": "11月2日 — 11月8日" } }
 ```
 
 `remaining_text` 形如 `71天23小时`；`status=deleted` 时 `remaining_seconds/remaining_text` 非空。
@@ -289,12 +292,12 @@
 
 ---
 
-## 7. 管理员
+## 7. 管理员与超级管理员
 
-以下接口仅管理员可用（否则 403）。
+以下「管理员接口」接受 `admin` 与 `super_admin`（否则 403）；管理员接口只操作楼层长账户，不能创建、修改、禁用或删除管理员账户。
 
 ### `GET /api/admin/accounts`
-200：`{ "accounts": [ /* AccountSummary，包含已删除账户 */ ] }`
+200：`{ "accounts": [ /* AccountSummary，包含已删除楼层长账户 */ ] }`
 
 ### `POST /api/admin/accounts`
 ```json
@@ -306,7 +309,7 @@
 ```json
 { "username": "f1b", "password": "newpass", "display_name": "一层" }
 ```
-200：`{ "account": {...} }`。管理员不可被此接口修改（除自身密码走 `/api/password`）。
+200：`{ "account": {...} }`。该接口只接受楼层长账户；管理员账户由 `/api/super-admin/admins` 管理，账户本人修改密码使用 `/api/password`。
 
 ### `POST /api/admin/accounts/:id/enable`
 200：`{ "account": {...} }`。状态 `disabled → enabled`。
@@ -365,6 +368,46 @@
                "notes": [ /* Note */ ], "images": [ /* Image */ ] } ] }
 ```
 
+### 超级管理员账户管理
+
+以下接口仅 `super_admin` 可用（普通管理员与楼层长返回 `403 forbidden`）。账户角色由服务端决定，请求体中的 `role` / `super_admin` 参数一律忽略。账户对象结构同 User（含 `status`、`last_login_at`、`deleted_at`、`delete_at`、`remaining_seconds`、`remaining_text`）。
+
+### `GET /api/super-admin/admins`
+200：`{ "accounts": [ /* User，含已删除管理员，超级管理员排在最前 */ ] }`
+
+### `POST /api/super-admin/admins`
+```json
+{ "username": "admin2", "password": "123456", "display_name": "二号管理员" }
+```
+201：`{ "account": { /* User */ } }`。账户名全局唯一（与楼层长共用唯一索引）；重复返回 `409 username_taken`。创建的角色固定为 `admin`。
+
+### `PATCH /api/super-admin/admins/:id`
+```json
+{ "username": "admin2b", "password": "newpass", "display_name": "二号管理员" }
+```
+字段均可选。200：`{ "account": {...} }`。重置密码后该账户全部 Session 立即失效；不能通过该接口修改账户角色。
+
+### `POST /api/super-admin/admins/:id/enable`
+200：`{ "account": {...} }`。状态 `disabled → enabled`。
+
+### `POST /api/super-admin/admins/:id/disable`
+二次确认 `{ "confirm": true }`。200：`{ "account": {...} }`。立即失效该账户全部 Session。禁用最后一个可用超级管理员返回 `409 last_super_admin`。
+
+### `POST /api/super-admin/admins/:id/delete`
+二次确认 `{ "confirm": true }`。200：`{ "account": {...} }`。管理员账户立即禁止登录并失效 Session，进入 72 天保留期；删除不会影响任何楼层长账户及其数据。删除最后一个可用超级管理员返回 `409 last_super_admin`。
+
+### `POST /api/super-admin/admins/:id/restore`
+撤销删除，二次确认 `{ "confirm": true }`。200：`{ "account": {...} }`。条件同楼层长账户撤销删除；否则 `409 restore_not_allowed`。
+
+### `GET /api/super-admin/backups/:id/download`
+导出指定备份为本地下载文件。必须携带 `X-CSRF-Token`（缺失或错误返回 `403 csrf_invalid`），且仅超级管理员可调用。
+
+- 200：`Content-Type: application/x-tar`，`Content-Disposition: attachment; filename="<dir_name>.tar"`。
+- 归档内容：`manifest.json`、`roomcheck.db`、`uploads/<account_id>/<week_id>/<file>`，即服务器备份目录的完整内容。
+- 导出前校验：数据库 `integrity_check`、数据库结构、清单 `database_sha256`、清单 `image_files` 数量、数据库 `note_image.rel_path` 对应的图片文件是否存在。任一校验失败返回 `500 backup_export_failed` 与明确错误信息，不生成部分文件。
+- 400 `invalid_backup`、404 `not_found`（备份记录不存在）。
+- 导出成功与失败均写入 `backup_export` 审计。
+
 ---
 
 ## 8. 审计动作名（action）
@@ -374,9 +417,9 @@
 `account_restore`、`account_purge`、`config_update`、`schedule_generate`、`schedule_regenerate`、
 `week_reset`、`check_toggle`、`note_create`、`note_update`、`note_delete`、`note_view`、
 `image_upload`、`image_delete`、`image_view`、`backup_success`、`backup_failed`、`backup_restore`、
-`log_cleanup`、`deletion_retry_failed`、`upload_cleanup`。
+`backup_export`、`log_cleanup`、`deletion_retry_failed`、`upload_cleanup`。
 
-`result`: `success` | `failure` | `warning`。
+`result`: `success` | `failure` | `warning`。`actor_type` 取值为 `super_admin` | `admin` | `floor_manager` | `system` | `anonymous`。
 
 ## 9. 静态页面路由
 
@@ -390,6 +433,7 @@
 - `localStorage.rc_theme`：`auto` | `light` | `dark`。
 - `localStorage.rc_csrf`：CSRF Token；登录/会话刷新时更新。
 - 所有修改操作在 UI 上需要二次确认：撤销勾选、重新生成、重置本周、禁用、删除、撤销删除、恢复备份。
-- 登录后根据 `user.role` 渲染：`floor_manager` → 查寝页；`admin` → 管理概览。
+- 登录后根据 `user.role` 渲染：`floor_manager` → 查寝页；`admin` / `super_admin` → 管理概览。超级管理员额外显示管理员账户管理区块与备份导出按钮。
+- 周标题统一显示真实周起止日期范围（`week_start` / `week_end`，`Asia/Shanghai`），不显示“年份 + 第 N 周”文本。
 - `must_change_password=true` 时强制展示改密弹窗，不可关闭，成功后重新进入。
 - 响应头启用严格 CSP（`script-src 'self'`），因此不能使用内联 `<script>`、`onclick` 等内联事件或 `javascript:` URL；所有脚本必须位于 `/js/*.js`。

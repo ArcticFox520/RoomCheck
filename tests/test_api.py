@@ -9,6 +9,7 @@ deletion, log retention).
 """
 import hashlib
 import http.cookiejar
+import io
 import json
 import os
 import shutil
@@ -17,6 +18,7 @@ import sqlite3
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import traceback
@@ -340,6 +342,126 @@ def test_admin_first_login_gate():
     t.ids["admin_session_ttl"] = expires - int(time.time())
 
 
+def test_super_admin_role_and_admin_accounts():
+    st, obj, _, _ = t.admin.call("GET", "/api/session")
+    expect_status((st, obj), 200, "超级管理员会话")
+    check(obj["user"]["role"] == "super_admin", "初始化管理员应迁移为超级管理员")
+    t.ids["super_admin"] = obj["user"]["id"]
+    row = t.server.sql_one("SELECT role, super_admin FROM account WHERE id=?",
+                           (t.ids["super_admin"],))
+    check(row["role"] == "admin" and row["super_admin"] == 1, "超级管理员存储结构")
+
+    st, obj, _, _ = t.admin.call("GET", "/api/super-admin/admins")
+    expect_status((st, obj), 200, "管理员账户列表")
+    check(any(a["id"] == t.ids["super_admin"] and a["role"] == "super_admin"
+              for a in obj["accounts"]), "列表包含超级管理员")
+
+    st, obj, _, _ = t.admin.call("POST", "/api/super-admin/admins",
+                                 {"username": "adm1", "password": "Admin1#2026",
+                                  "display_name": "管理员一", "role": "super_admin",
+                                  "super_admin": True})
+    expect_status((st, obj), 201, "超级管理员创建管理员")
+    check(obj["account"]["role"] == "admin", "伪造 role 参数不能提升权限")
+    t.ids["adm1"] = obj["account"]["id"]
+    check(t.server.sql_one("SELECT super_admin FROM account WHERE id=?",
+                           (t.ids["adm1"],))["super_admin"] == 0, "新管理员不是超级管理员")
+
+    st, obj, _, _ = t.admin.call("POST", "/api/super-admin/admins",
+                                 {"username": "adm1", "password": "x"})
+    expect_status((st, obj), 409, "管理员账户名重复拒绝")
+    st, obj, _, _ = t.admin.call("POST", "/api/admin/accounts",
+                                 {"username": "adm1", "password": "x", "display_name": "x"})
+    expect_status((st, obj), 409, "楼层长不能与管理员重名")
+
+    adm1 = Client(t.server)
+    st, obj = adm1.login("adm1", "Admin1#2026")
+    expect_status((st, obj), 200, "普通管理员登录")
+    check(obj["user"]["role"] == "admin", "普通管理员角色")
+    st, obj, _, _ = adm1.call("GET", "/api/admin/accounts")
+    expect_status((st, obj), 200, "普通管理员保留楼层长管理权限")
+    st, obj, _, _ = adm1.call("GET", "/api/super-admin/admins")
+    expect_status((st, obj), 403, "普通管理员不能访问管理员管理接口")
+    st, obj, _, _ = adm1.call("POST", "/api/super-admin/admins",
+                              {"username": "evil", "password": "x"})
+    expect_status((st, obj), 403, "普通管理员不能创建管理员")
+    st, obj, _, _ = adm1.call("PATCH", "/api/admin/accounts/%d" % t.ids["adm1"],
+                              {"display_name": "提权", "role": "super_admin"})
+    expect_status((st, obj), 404, "楼层长接口不能修改管理员账户")
+    st, obj, _, _ = adm1.call("POST",
+                              "/api/super-admin/admins/%d/disable" % t.ids["super_admin"],
+                              {"confirm": True})
+    expect_status((st, obj), 403, "普通管理员不能禁用超级管理员")
+    st, obj, _, _ = adm1.call("PATCH", "/api/profile",
+                              {"display_name": "管理员一", "role": "super_admin"})
+    expect_status((st, obj), 200, "普通管理员修改本人资料")
+    check(obj["user"]["role"] == "admin", "资料接口不能提升角色")
+
+    st, obj, _, _ = t.admin.call("PATCH", "/api/super-admin/admins/%d" % t.ids["adm1"],
+                                 {"username": "adm1b", "password": "Admin1New#2026",
+                                  "role": "super_admin"})
+    expect_status((st, obj), 200, "超级管理员修改管理员账户")
+    check(obj["account"]["username"] == "adm1b" and obj["account"]["role"] == "admin",
+          "管理员修改结果")
+    st, obj, _, _ = adm1.call("GET", "/api/session")
+    expect_status((st, obj), 401, "修改管理员密码后旧会话失效")
+    st, obj = adm1.login("adm1", "Admin1#2026")
+    expect_status((st, obj), 401, "管理员旧密码失效")
+    st, obj = adm1.login("adm1b", "Admin1New#2026")
+    expect_status((st, obj), 200, "管理员新账户名密码可登录")
+    st, obj, _, _ = t.admin.call("PATCH", "/api/super-admin/admins/%d" % t.ids["adm1"],
+                                 {"username": "adm1", "password": "Admin1#2026"})
+    expect_status((st, obj), 200, "恢复管理员账户名与密码")
+
+    adm1 = Client(t.server)
+    expect_status(adm1.login("adm1", "Admin1#2026"), 200, "管理员重新登录")
+    st, obj, _, _ = t.admin.call("POST",
+                                 "/api/super-admin/admins/%d/disable" % t.ids["adm1"],
+                                 {"confirm": True})
+    expect_status((st, obj), 200, "超级管理员禁用管理员")
+    check(obj["account"]["status"] == "disabled", "管理员禁用状态")
+    st, obj, _, _ = adm1.call("GET", "/api/session")
+    expect_status((st, obj), 401, "禁用管理员后会话立即失效")
+    st, obj = adm1.login("adm1", "Admin1#2026")
+    expect_status((st, obj), 403, "禁用管理员后禁止登录")
+    check(obj["error"]["code"] == "account_disabled", "管理员禁用登录错误码")
+    st, obj, _, _ = t.admin.call("POST",
+                                 "/api/super-admin/admins/%d/enable" % t.ids["adm1"],
+                                 {"confirm": True})
+    expect_status((st, obj), 200, "超级管理员启用管理员")
+    adm1 = Client(t.server)
+    expect_status(adm1.login("adm1", "Admin1#2026"), 200, "管理员启用后可登录")
+
+    fm_count = t.server.sql_one(
+        "SELECT COUNT(*) c FROM account WHERE role='floor_manager'")["c"]
+    st, obj, _, _ = t.admin.call("POST",
+                                 "/api/super-admin/admins/%d/delete" % t.ids["adm1"],
+                                 {"confirm": True})
+    expect_status((st, obj), 200, "超级管理员删除管理员")
+    check(obj["account"]["status"] == "deleted", "管理员删除状态")
+    check(t.server.sql_one(
+        "SELECT COUNT(*) c FROM account WHERE role='floor_manager'")["c"] == fm_count,
+        "删除管理员不影响楼层长账户")
+    st, obj = adm1.login("adm1", "Admin1#2026")
+    expect_status((st, obj), 403, "管理员删除后禁止登录")
+    st, obj, _, _ = t.admin.call("POST",
+                                 "/api/super-admin/admins/%d/restore" % t.ids["adm1"],
+                                 {"confirm": True})
+    expect_status((st, obj), 200, "超级管理员撤销删除管理员")
+    check(obj["account"]["status"] == "enabled", "管理员恢复启用")
+
+    st, obj, _, _ = t.admin.call("POST",
+                                 "/api/super-admin/admins/%d/disable" % t.ids["super_admin"],
+                                 {"confirm": True})
+    expect_status((st, obj), 409, "不能禁用最后一个可用超级管理员")
+    check(obj["error"]["code"] == "last_super_admin", "最后超级管理员禁用错误码")
+    st, obj, _, _ = t.admin.call("POST",
+                                 "/api/super-admin/admins/%d/delete" % t.ids["super_admin"],
+                                 {"confirm": True})
+    expect_status((st, obj), 409, "不能删除最后一个可用超级管理员")
+    st, obj, _, _ = t.admin.call("GET", "/api/session")
+    expect_status((st, obj), 200, "拒绝后超级管理员会话仍然有效")
+
+
 def test_account_crud_validation():
     st, obj, _, _ = t.admin.call("POST", "/api/admin/accounts",
                                  {"username": "m1", "password": "Manager1#2026",
@@ -360,6 +482,34 @@ def test_account_crud_validation():
                                  {"username": "m4", "password": "Manager4#2026"})
     expect_status((st, obj), 201, "创建楼层长 m4")
     t.ids["m4"] = obj["account"]["id"]
+
+
+def test_super_admin_manages_floor_managers():
+    st, obj, _, _ = t.admin.call("POST", "/api/admin/accounts",
+                                 {"username": "safm", "password": "SaFm#2026",
+                                  "display_name": "超级管理员创建"})
+    expect_status((st, obj), 201, "超级管理员创建楼层长")
+    check(obj["account"]["role"] == "floor_manager", "楼层长角色")
+    fid = obj["account"]["id"]
+    st, obj, _, _ = t.admin.call("PATCH", "/api/admin/accounts/%d" % fid,
+                                 {"username": "safm2", "password": "SaFm2#2026",
+                                  "display_name": "已修改"})
+    expect_status((st, obj), 200, "超级管理员修改楼层长")
+    check(obj["account"]["username"] == "safm2", "楼层长账户名修改")
+    st, obj, _, _ = t.admin.call("POST", "/api/admin/accounts/%d/disable" % fid,
+                                 {"confirm": True})
+    expect_status((st, obj), 200, "超级管理员禁用楼层长")
+    st, obj, _, _ = t.admin.call("POST", "/api/admin/accounts/%d/enable" % fid,
+                                 {"confirm": True})
+    expect_status((st, obj), 200, "超级管理员启用楼层长")
+    st, obj, _, _ = t.admin.call("POST", "/api/admin/accounts/%d/delete" % fid,
+                                 {"confirm": True})
+    expect_status((st, obj), 200, "超级管理员删除楼层长")
+    st, obj, _, _ = t.admin.call("POST", "/api/admin/accounts/%d/restore" % fid,
+                                 {"confirm": True})
+    expect_status((st, obj), 200, "超级管理员恢复楼层长")
+    c = Client(t.server)
+    expect_status(c.login("safm2", "SaFm2#2026"), 200, "楼层长恢复后正常登录")
 
 
 def test_manager_login_and_config_validation():
@@ -404,6 +554,79 @@ def test_manager_login_and_config_validation():
     all_rooms = t.rooms(week)
     check(len(all_rooms) == len(set(r["room_number"] for r in all_rooms)), "无重复寝室")
     check("105" not in [r["room_number"] for r in all_rooms], "无需查寝寝室不出现")
+
+
+def test_week_date_range_display():
+    st, obj, _, _ = t.admin.call("POST", "/api/admin/accounts",
+                                 {"username": "weekfm", "password": "WeekFm#2026",
+                                  "display_name": "周显示"})
+    expect_status((st, obj), 201, "创建周显示账户")
+    wid = obj["account"]["id"]
+    wf = Client(t.server)
+    expect_status(wf.login("weekfm", "WeekFm#2026"), 200, "周显示账户登录")
+    st, obj, _, _ = t.set_config(wf, "周显示楼", "501", "506", [])
+    expect_status((st, obj), 200, "周显示账户配置")
+
+    week = t.week(wf)
+    info = week["week"]
+    start = datetime.strptime(info["week_start"], "%Y-%m-%d").date()
+    end = datetime.strptime(info["week_end"], "%Y-%m-%d").date()
+    check(start.weekday() == 0, "周起始必须是周一")
+    check((end - start).days == 6, "周结束必须是周日")
+    check(info["label"] == "%d月%d日 — %d月%d日" %
+          (start.month, start.day, end.month, end.day),
+          "周标题应为真实日期范围: %s" % info["label"])
+    check("年第" not in info["label"], "周标题不再包含年份周数")
+
+    week_id = t.server.sql_one(
+        "SELECT id FROM week_plan WHERE account_id=? ORDER BY id DESC LIMIT 1",
+        (wid,))["id"]
+
+    def shanghai_epoch(y, m, d):
+        return int(datetime(y, m, d, tzinfo=timezone(timedelta(hours=8))).timestamp())
+
+    def set_week_range(start_text, end_text):
+        start_epoch = shanghai_epoch(*[int(x) for x in start_text.split("-")])
+        end_epoch = shanghai_epoch(*[int(x) for x in end_text.split("-")]) + 86399
+        with t.server.db() as conn:
+            conn.execute("UPDATE week_plan SET week_start=?, week_end=? WHERE id=?",
+                         (start_epoch, end_epoch, week_id))
+
+    set_week_range("2026-11-30", "2026-12-06")
+    week = t.week(wf)
+    check(week["week"]["week_start"] == "2026-11-30", "跨月周起始")
+    check(week["week"]["week_end"] == "2026-12-06", "跨月周结束")
+    check(week["week"]["label"] == "11月30日 — 12月6日", "跨月周日期范围")
+    check(week["days"][0]["date"] == "2026-11-30", "周内日期来自真实周起始")
+
+    set_week_range("2025-12-29", "2026-01-04")
+    week = t.week(wf)
+    check(week["week"]["week_start"] == "2025-12-29", "跨年周起始")
+    check(week["week"]["week_end"] == "2026-01-04", "跨年周结束")
+    check(week["week"]["label"] == "12月29日 — 1月4日", "跨年周日期范围")
+
+    st, obj, _, _ = t.admin.call("GET", "/api/admin/accounts/%d/week" % wid)
+    expect_status((st, obj), 200, "管理员周视图")
+    check(obj["week"]["label"] == "12月29日 — 1月4日", "管理员周视图日期范围")
+    check(obj["week"]["week_start"] == "2025-12-29", "管理员周视图真实日期")
+
+    st, obj, _, _ = t.admin.call("GET", "/api/admin/accounts")
+    expect_status((st, obj), 200, "管理员账户列表")
+    entry = [a for a in obj["accounts"] if a["username"] == "weekfm"][0]
+    check(entry["week"]["week_start"] == "2025-12-29", "账户列表周起始")
+    check(entry["week"]["week_end"] == "2026-01-04", "账户列表周结束")
+    check(entry["week"]["label"] == "12月29日 — 1月4日", "账户列表日期范围")
+
+    app_js_path = os.path.join(ROOT, "frontend", "js", "app.js")
+    with open(app_js_path, "r", encoding="utf-8") as fh:
+        app_js = fh.read()
+    check("年第" not in app_js, "前端不得再出现年份周数标题")
+    check("info.label" not in app_js and "week.label" not in app_js,
+          "前端不再使用周标签字段")
+    check("formatWeekRange(info.week_start, info.week_end)" in app_js,
+          "查寝周视图使用真实周起止日期")
+    check("formatWeekRange(account.week.week_start, account.week.week_end)" in app_js,
+          "管理员账户列表使用真实周起止日期")
 
 
 def test_check_and_csrf():
@@ -792,6 +1015,128 @@ def test_backup_and_restore():
           "恢复后备注回滚")
 
 
+def test_backup_export():
+    week = t.week(t.m1)
+    room = t.room(week, "101")
+    st, obj, _, _ = t.m1.upload(room["id"], filename="export.png")
+    expect_status((st, obj), 201, "导出前上传图片")
+
+    st, obj, _, _ = t.admin.call("POST", "/api/admin/backups")
+    expect_status((st, obj), 201, "创建待导出备份")
+    backup = obj["backup"]
+    path = "/api/super-admin/backups/%d/download" % backup["id"]
+
+    anon = Client(t.server)
+    st, obj, _, _ = anon.call("GET", path)
+    expect_status((st, obj), 401, "未登录不能导出备份")
+    adm1 = Client(t.server)
+    expect_status(adm1.login("adm1", "Admin1#2026"), 200, "普通管理员导出测试登录")
+    st, obj, _, _ = adm1.call("GET", path)
+    expect_status((st, obj), 403, "普通管理员不能导出备份")
+    st, obj, _, _ = t.m1.call("GET", path)
+    expect_status((st, obj), 403, "楼层长不能导出备份")
+    st, obj, _, _ = t.admin.call("GET", path)
+    expect_status((st, obj), 403, "导出缺少 CSRF Token 应被拒绝")
+    check(obj["error"]["code"] == "csrf_invalid", "导出 CSRF 错误码")
+
+    st, obj, headers, body = t.admin.call("GET", path,
+                                          headers={"X-CSRF-Token": t.admin.csrf})
+    expect_status((st, obj), 200, "超级管理员导出备份")
+    check("application/x-tar" in headers.get("Content-Type", ""), "导出内容类型")
+    disposition = headers.get("Content-Disposition", "")
+    check("attachment" in disposition, "导出附件响应头")
+    check(disposition.endswith('.tar"'), "导出文件名为 .tar: %s" % disposition)
+
+    with tarfile.open(fileobj=io.BytesIO(body), mode="r:") as archive:
+        members = {m.name: m for m in archive.getmembers()}
+        check("roomcheck.db" in members, "导出包含 SQLite 数据库")
+        check("manifest.json" in members, "导出包含备份清单")
+        manifest = json.loads(archive.extractfile("manifest.json").read().decode("utf-8"))
+        db_bytes = archive.extractfile("roomcheck.db").read()
+        check(hashlib.sha256(db_bytes).hexdigest() == manifest["database_sha256"],
+              "导出数据库与清单校验一致")
+        upload_names = sorted(n for n, m in members.items()
+                              if n.startswith("uploads/") and m.isfile())
+        check(manifest["image_files"] == len(upload_names), "导出图片数量与清单一致")
+        check(len(upload_names) > 0, "导出必须包含图片文件")
+        tmpdir = tempfile.mkdtemp(prefix="roomcheck-export-")
+        try:
+            for member in archive.getmembers():
+                check(not member.name.startswith("/") and ".." not in member.name.split("/"),
+                      "导出路径安全: %s" % member.name)
+                archive.extract(member, tmpdir)
+            extracted_db = os.path.join(tmpdir, "roomcheck.db")
+            conn = sqlite3.connect(extracted_db)
+            try:
+                check(conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok",
+                      "导出数据库可正常识别")
+                image_rows = conn.execute("SELECT COUNT(*) FROM note_image").fetchone()[0]
+                check(image_rows > 0, "导出数据库包含图片记录")
+                rels = [r[0] for r in conn.execute("SELECT rel_path FROM note_image")]
+            finally:
+                conn.close()
+            backup_dir = os.path.join(t.server.data_dir, "backups", backup["dir_name"])
+            for rel in rels:
+                check(os.path.isfile(os.path.join(tmpdir, "uploads", rel)),
+                      "导出文件包含数据库记录的图片: %s" % rel)
+                check(os.path.isfile(os.path.join(backup_dir, "uploads", rel)),
+                      "服务器备份包含数据库记录的图片: %s" % rel)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    st, obj, _, _ = t.admin.call("GET", "/api/super-admin/backups/999999/download",
+                                 headers={"X-CSRF-Token": t.admin.csrf})
+    expect_status((st, obj), 404, "不存在的备份不能导出")
+
+    st, obj, _, _ = t.admin.call("GET", "/uploads/1/1/x.png")
+    expect_status((st, obj), 404, "图片目录不能作为静态资源访问")
+    st, obj, _, _ = t.admin.call(
+        "GET", "/backups/%s/roomcheck.db" % backup["dir_name"])
+    expect_status((st, obj), 404, "备份目录不能作为静态资源访问")
+
+    st, obj, _, _ = t.admin.call("POST", "/api/admin/backups")
+    expect_status((st, obj), 201, "创建不完整备份")
+    broken = obj["backup"]
+    broken_dir = os.path.join(t.server.data_dir, "backups", broken["dir_name"])
+    removed = False
+    for root, _dirs, files in os.walk(os.path.join(broken_dir, "uploads")):
+        for name in files:
+            os.unlink(os.path.join(root, name))
+            removed = True
+            break
+        if removed:
+            break
+    check(removed, "不完整备份测试需要至少一个图片文件")
+    st, obj, _, _ = t.admin.call(
+        "GET", "/api/super-admin/backups/%d/download" % broken["id"],
+        headers={"X-CSRF-Token": t.admin.csrf})
+    expect_status((st, obj), 500, "不完整备份不能导出")
+    check(obj["error"]["code"] == "backup_export_failed", "不完整备份导出错误码")
+    with t.server.db() as conn:
+        conn.execute("DELETE FROM backup_record WHERE id=?", (broken["id"],))
+    shutil.rmtree(broken_dir, ignore_errors=True)
+
+    st, obj, _, _ = t.admin.call("POST", "/api/admin/backups")
+    expect_status((st, obj), 201, "创建篡改测试备份")
+    tampered = obj["backup"]
+    tampered_dir = os.path.join(t.server.data_dir, "backups", tampered["dir_name"])
+    with open(os.path.join(tampered_dir, "roomcheck.db"), "r+b") as fh:
+        fh.seek(0)
+        fh.write(b"corrupted")
+    st, obj, _, _ = t.admin.call(
+        "GET", "/api/super-admin/backups/%d/download" % tampered["id"],
+        headers={"X-CSRF-Token": t.admin.csrf})
+    expect_status((st, obj), 500, "被篡改的备份不能导出")
+    with t.server.db() as conn:
+        conn.execute("DELETE FROM backup_record WHERE id=?", (tampered["id"],))
+    shutil.rmtree(tampered_dir, ignore_errors=True)
+
+    st, obj, _, _ = t.admin.call("GET", "/api/admin/logs?action=backup_export")
+    expect_status((st, obj), 200, "导出审计日志")
+    check(any(i["result"] == "success" for i in obj["items"]), "成功导出写入审计")
+    check(any(i["result"] == "failure" for i in obj["items"]), "失败导出写入审计")
+
+
 def test_session_expiry():
     c = Client(t.server)
     expect_status(c.login("m1", "Manager1#2026"), 200, "会话登录")
@@ -967,6 +1312,108 @@ def test_admin_reset_keeps_floor_manager_data():
     t.admin.csrf = obj["csrf_token"]
 
 
+def test_upgrade_to_super_admin():
+    s = Server()
+    try:
+        s.start()
+        c = Client(s)
+        st, obj = c.login("admin", ADMIN_INIT_PW)
+        expect_status((st, obj), 200, "升级前管理员登录")
+        check(obj["user"]["role"] == "super_admin", "新安装即为超级管理员")
+        st, obj, _, _ = c.call("POST", "/api/password",
+                               {"old_password": ADMIN_INIT_PW,
+                                "new_password": "Upgrade#2026"})
+        expect_status((st, obj), 200, "升级前修改管理员密码")
+        c.csrf = obj["csrf_token"]
+        st, obj, _, _ = c.call("POST", "/api/admin/accounts",
+                               {"username": "legacyfm", "password": "LegacyFm#2026",
+                                "display_name": "旧楼层长"})
+        expect_status((st, obj), 201, "升级前创建楼层长")
+        fid = obj["account"]["id"]
+        st, obj, _, _ = c.call("PUT", "/api/config",
+                               {"account_id": fid, "building_name": "旧楼",
+                                "start_room": "101", "end_room": "104",
+                                "excluded_rooms": []})
+        expect_status((st, obj), 200, "升级前配置楼层长")
+        week_before = s.sql_one("SELECT id FROM week_plan WHERE account_id=?",
+                                (fid,))["id"]
+        fm = Client(s)
+        expect_status(fm.login("legacyfm", "LegacyFm#2026"), 200, "升级前楼层长登录")
+        st, week, _, _ = fm.call("GET", "/api/week")
+        expect_status((st, week), 200, "升级前楼层长周视图")
+        room = [r for d in week["days"] for g in d["groups"] for r in g["rooms"]
+                if r["room_number"] == "101"][0]
+        st, obj, _, _ = fm.add_note(room["id"], "升级前备注")
+        expect_status((st, obj), 201, "升级前备注")
+        st, obj, _, _ = fm.upload(room["id"], filename="legacy.png")
+        expect_status((st, obj), 201, "升级前图片")
+        notes_before = s.sql_one("SELECT COUNT(*) c FROM note WHERE account_id=?",
+                                 (fid,))["c"]
+        images_before = s.sql_one("SELECT COUNT(*) c FROM note_image WHERE account_id=?",
+                                  (fid,))["c"]
+        audit_before = s.sql_one("SELECT COUNT(*) c FROM audit_log")["c"]
+        check(notes_before >= 1 and images_before >= 1, "升级前备注与图片已写入")
+        s.stop()
+
+        with s.db() as conn:
+            conn.execute("ALTER TABLE account DROP COLUMN super_admin")
+            conn.execute("PRAGMA user_version=1")
+        columns = [row["name"] for row in s.sql("PRAGMA table_info(account)")]
+        check("super_admin" not in columns, "模拟旧库缺少超级管理员字段")
+
+        s.start()
+        st, obj, _, _ = c.call("GET", "/api/session")
+        expect_status((st, obj), 401, "升级后旧管理员会话失效")
+        st, obj = c.login("admin", "Upgrade#2026")
+        expect_status((st, obj), 200, "升级后保留原密码")
+        check(obj["user"]["role"] == "super_admin", "升级后管理员成为超级管理员")
+        check(obj["user"]["must_change_password"] is False, "升级不强制修改密码")
+        c.csrf = obj["csrf_token"]
+        columns = [row["name"] for row in s.sql("PRAGMA table_info(account)")]
+        check("super_admin" in columns, "升级迁移账户结构")
+        check(s.sql_one("SELECT COUNT(*) c FROM account WHERE role='admin'")["c"] == 1,
+              "升级不产生重复管理员")
+        check(s.sql_one("SELECT COUNT(*) c FROM account WHERE role='admin' "
+                        "AND super_admin=1")["c"] == 1, "升级只提升一个超级管理员")
+        check(s.sql_one("SELECT COUNT(*) c FROM week_plan WHERE account_id=?",
+                        (fid,))["c"] == 1, "升级保留楼层长周计划")
+        st, obj, _, _ = c.call("GET", "/api/admin/accounts/%d/week" % fid)
+        expect_status((st, obj), 200, "升级后超级管理员可查看楼层长周视图")
+        check(obj["week"]["id"] == week_before, "升级保留原周计划 ID")
+        fm = Client(s)
+        expect_status(fm.login("legacyfm", "LegacyFm#2026"), 200, "升级后楼层长正常登录")
+        check(s.sql_one("SELECT COUNT(*) c FROM note WHERE account_id=?",
+                        (fid,))["c"] == notes_before, "升级保留备注")
+        check(s.sql_one("SELECT COUNT(*) c FROM note_image WHERE account_id=?",
+                        (fid,))["c"] == images_before, "升级保留图片记录")
+        check(s.sql_one("SELECT COUNT(*) c FROM note WHERE content='升级前备注'")["c"] == 1,
+              "升级保留备注内容")
+        check(s.sql_one("SELECT COUNT(*) c FROM audit_log")["c"] >= audit_before,
+              "升级保留审计记录")
+        rel = s.sql_one("SELECT rel_path FROM note_image WHERE account_id=?",
+                        (fid,))["rel_path"]
+        check(os.path.isfile(os.path.join(s.data_dir, "uploads", rel)),
+              "升级保留图片文件")
+        st, week, _, _ = fm.call("GET", "/api/week")
+        expect_status((st, week), 200, "升级后楼层长周视图")
+        new_room = [r for d in week["days"] for g in d["groups"] for r in g["rooms"]
+                    if r["room_number"] == "101"][0]
+        check(new_room["notes_count"] >= 1 and new_room["images_count"] >= 1,
+              "升级后周视图包含原备注与图片")
+
+        s.stop()
+        s.start()
+        check(s.sql_one("SELECT COUNT(*) c FROM account WHERE role='admin'")["c"] == 1,
+              "迁移可重复执行")
+        check(s.sql_one("SELECT COUNT(*) c FROM account WHERE role='admin' "
+                        "AND super_admin=1")["c"] == 1, "重复迁移不产生额外超级管理员")
+        st, obj = c.login("admin", "Upgrade#2026")
+        expect_status((st, obj), 200, "重复迁移后正常登录")
+        check(obj["user"]["role"] == "super_admin", "重复迁移后角色不变")
+    finally:
+        s.cleanup()
+
+
 def test_automatic_daily_backup():
     """启动补偿逻辑：当天 03:00 后启动且无当日备份时自动创建一份。"""
     s2 = Server()
@@ -1002,8 +1449,11 @@ TEST_ORDER = [
     test_health_and_static,
     test_unauthenticated_and_csrf,
     test_admin_first_login_gate,
+    test_super_admin_role_and_admin_accounts,
     test_account_crud_validation,
+    test_super_admin_manages_floor_managers,
     test_manager_login_and_config_validation,
+    test_week_date_range_display,
     test_check_and_csrf,
     test_notes_and_limits,
     test_image_security,
@@ -1015,12 +1465,14 @@ TEST_ORDER = [
     test_lockout_memory_only,
     test_image_count_limit,
     test_backup_and_restore,
+    test_backup_export,
     test_session_expiry,
     test_audit_log_retention,
     test_expiry_purge,
     test_backup_retention,
     test_admin_log_filters,
     test_admin_reset_keeps_floor_manager_data,
+    test_upgrade_to_super_admin,
     test_automatic_daily_backup,
     test_final_session_ttl,
 ]

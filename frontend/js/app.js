@@ -18,7 +18,7 @@
   var api = RC && RC.api;
 
   var THEME_KEY = 'rc_theme';
-  var ROLE_LABELS = { admin: '管理员', floor_manager: '楼层长' };
+  var ROLE_LABELS = { super_admin: '超级管理员', admin: '管理员', floor_manager: '楼层长' };
   var WEEKDAY_LABELS = {
     0: '周一',
     1: '周二',
@@ -69,6 +69,7 @@
     backup_success: '备份成功',
     backup_failed: '备份失败',
     backup_restore: '恢复备份',
+    backup_export: '导出备份',
     log_cleanup: '清理日志',
     deletion_retry_failed: '永久删除重试失败'
   };
@@ -79,7 +80,8 @@
     'account_purge', 'config_update', 'schedule_generate', 'schedule_regenerate',
     'week_reset', 'check_toggle', 'note_create', 'note_update', 'note_delete',
     'note_view', 'image_upload', 'image_delete', 'image_view', 'backup_success',
-    'backup_failed', 'backup_restore', 'log_cleanup', 'deletion_retry_failed'
+    'backup_failed', 'backup_restore', 'backup_export', 'log_cleanup',
+    'deletion_retry_failed'
   ];
 
   var els = { app: null, header: null, view: null, toast: null, modal: null, themeColor: null };
@@ -106,6 +108,7 @@
     overview: null,
     overviewDate: '',
     accounts: [],
+    adminAccounts: [],
     accountFilter: 'all',
     backups: [],
     logs: { items: [], total: 0, page: 1, pageSize: 20, actions: [] },
@@ -276,8 +279,12 @@
     return (window.location.hash || '').replace(/^#/, '') || '/';
   }
 
+  function isSuperAdmin() {
+    return !!state.user && state.user.role === 'super_admin';
+  }
+
   function isAdmin() {
-    return !!state.user && state.user.role === 'admin';
+    return !!state.user && (state.user.role === 'admin' || state.user.role === 'super_admin');
   }
 
   function isManager() {
@@ -665,6 +672,7 @@
     state.overview = null;
     state.overviewDate = '';
     state.accounts = [];
+    state.adminAccounts = [];
     state.backups = [];
     state.logs = { items: [], total: 0, page: 1, pageSize: 20, actions: [] };
     state.adminDetail = null;
@@ -1245,8 +1253,7 @@
     var accountHtml = account ? '<p class="week-range">' + esc(account.display_name || account.username || '') + ' · ' + esc(roleLabel(account.role)) + '</p>' : '';
     return '<section class="card week-card">' +
       '<div class="week-top"><div class="week-title">' +
-      '<h2 class="week-label">' + esc(info.label || '本周') + '</h2>' +
-      '<p class="week-range">' + esc(formatWeekRange(info.week_start, info.week_end)) + '</p>' +
+      '<h2 class="week-label">' + esc(formatWeekRange(info.week_start, info.week_end)) + '</h2>' +
       accountHtml +
       '</div><div class="week-meta">' + weekSummaryMeta(week) + '</div></div>' +
       progressHtml(week) +
@@ -2842,7 +2849,7 @@
 
   function accountProgressHtml(account) {
     var progress = account ? account.progress : null;
-    var weekLabel = account && account.week ? account.week.label : '';
+    var weekLabel = account && account.week ? formatWeekRange(account.week.week_start, account.week.week_end) : '';
     if (!progress) {
       return '<div class="row-sub">暂无进度</div>' +
         (weekLabel ? '<div class="row-sub">' + esc(weekLabel) + '</div>' : '');
@@ -3019,15 +3026,98 @@
       }).join('') + '</tbody></table></div>';
   }
 
+  function findAdminAccountById(accountId) {
+    for (var i = 0; i < state.adminAccounts.length; i += 1) {
+      if (Number(state.adminAccounts[i].id) === Number(accountId)) { return state.adminAccounts[i]; }
+    }
+    return null;
+  }
+
+  function adminAccountActionsHtml(account) {
+    var id = num(account.id);
+    var enabledSuperAdmins = state.adminAccounts.filter(function (item) {
+      return item.role === 'super_admin' && item.status === 'enabled';
+    }).length;
+    var protectedSuper = account.role === 'super_admin' && enabledSuperAdmins <= 1;
+    if (account.status === 'deleted') {
+      var remaining = accountRemainingSeconds(account);
+      return '<button class="btn btn-sm" type="button" data-action="restore-admin" data-account-id="' + id + '"' +
+        (remaining > 0 ? '' : ' disabled') + '>' + icon('refresh') + (remaining > 0 ? '撤销删除' : '已到期') + '</button>';
+    }
+    var buttons = '<button class="btn btn-sm" type="button" data-action="edit-admin" data-account-id="' + id + '">' +
+      icon('edit') + '编辑</button>';
+    if (account.status === 'enabled') {
+      buttons += '<button class="btn btn-sm" type="button" data-action="disable-admin" data-account-id="' + id + '"' +
+        (protectedSuper ? ' disabled' : '') + '>禁用</button>';
+    } else if (account.status === 'disabled') {
+      buttons += '<button class="btn btn-sm" type="button" data-action="enable-admin" data-account-id="' + id + '">' + icon('check') + '启用</button>';
+    }
+    buttons += '<button class="btn btn-sm text-danger" type="button" data-action="delete-admin" data-account-id="' + id + '"' +
+      (protectedSuper ? ' disabled' : '') + '>' + icon('trash') + '删除</button>';
+    return buttons;
+  }
+
+  function adminAccountsTableHtml(accounts) {
+    if (!accounts.length) {
+      return '<div class="empty-state empty-state--compact"><div class="empty-icon">' + icon('lock') + '</div>' +
+        '<h3 class="empty-title">还没有管理员账户</h3>' +
+        '<p class="empty-text">使用上方的表单创建管理员账户。</p></div>';
+    }
+    return '<div class="table-wrap"><table class="data-table">' +
+      '<thead><tr><th>账户</th><th>账户类型</th><th>状态</th><th>最近登录</th><th>删除信息</th><th>操作</th></tr></thead>' +
+      '<tbody>' + accounts.map(function (account) {
+        return '<tr>' +
+          '<td data-label="账户"><div class="row-account"><span class="row-name">' + esc(account.username) + '</span>' +
+          '<span class="row-sub">' + esc(account.display_name || '—') + '</span></div></td>' +
+          '<td data-label="账户类型"><span class="badge' + (account.role === 'super_admin' ? ' badge--accent' : '') + '">' +
+          esc(roleLabel(account.role)) + '</span></td>' +
+          '<td data-label="状态">' + statusBadge(account.status) + '</td>' +
+          '<td data-label="最近登录">' + esc(account.last_login_at ? formatShanghaiDateTime(account.last_login_at) : '—') + '</td>' +
+          '<td class="cell-countdown" data-label="删除信息">' + accountDeletionHtml(account) + '</td>' +
+          '<td class="cell-actions" data-label="操作"><div class="row-actions">' + adminAccountActionsHtml(account) + '</div></td>' +
+          '</tr>';
+      }).join('') + '</tbody></table></div>';
+  }
+
+  function adminCreateCardHtml() {
+    return '<section class="card form-card">' +
+      '<div class="section-head"><div><h2 class="section-title">' + icon('plus') + '新建管理员</h2>' +
+      '<p class="field-hint">账户名全局唯一，可与楼层长账户名不同；初始密码不强制修改。</p></div></div>' +
+      '<form class="inline-form" id="createAdminForm" novalidate>' +
+      '<label class="field"><span class="field-label">账户名</span>' +
+      '<input class="input" name="username" type="text" autocomplete="off" maxlength="40" required placeholder="例如：admin2"></label>' +
+      '<label class="field"><span class="field-label">初始密码</span>' +
+      '<input class="input" name="password" type="password" autocomplete="new-password" required placeholder="设置初始密码"></label>' +
+      '<label class="field"><span class="field-label">显示名</span>' +
+      '<input class="input" name="display_name" type="text" maxlength="40" placeholder="例如：二号管理员"></label>' +
+      '<button class="btn btn-accent" type="submit" id="createAdminSubmit">' + icon('plus') + '创建管理员</button>' +
+      '</form></section>';
+  }
+
+  function adminTableCardHtml() {
+    var accounts = state.adminAccounts || [];
+    return '<section class="card table-card">' +
+      '<div class="section-head"><div><h2 class="section-title">管理员账户</h2>' +
+      '<p class="field-hint">超级管理员可以管理管理员账户；最后一个可用超级管理员不能被禁用或删除。</p></div>' +
+      '<span class="badge">' + accounts.length + ' 个</span></div>' +
+      adminAccountsTableHtml(accounts) +
+      '</section>';
+  }
+
   function renderAccountsPage() {
     state.view = 'admin-accounts';
     renderAppShell();
     els.view.innerHTML = loadingPageHtml('管理员', '账户管理');
     var token = ++renderSeq;
-    api.get('/api/admin/accounts')
-      .then(function (data) {
+    var requests = [api.get('/api/admin/accounts')];
+    if (isSuperAdmin()) { requests.push(api.get('/api/super-admin/admins')); }
+    Promise.all(requests)
+      .then(function (results) {
         if (token !== renderSeq || state.view !== 'admin-accounts' || !state.user) { return; }
-        state.accounts = Array.isArray(data.accounts) ? data.accounts : [];
+        state.accounts = Array.isArray(results[0].accounts) ? results[0].accounts : [];
+        if (isSuperAdmin()) {
+          state.adminAccounts = Array.isArray(results[1].accounts) ? results[1].accounts : [];
+        }
         renderAccountsContent();
       })
       .catch(function (err) {
@@ -3062,7 +3152,9 @@
     var head = pageHeadHtml({
       eyebrow: '管理员',
       title: '账户管理',
-      sub: '创建和管理楼层长账户；删除账户后进入 72 天保留期，到期自动永久删除。',
+      sub: isSuperAdmin() ?
+        '创建和管理楼层长账户，并管理管理员账户；删除账户后进入 72 天保留期，到期自动永久删除。' :
+        '创建和管理楼层长账户；删除账户后进入 72 天保留期，到期自动永久删除。',
       actions: '<button class="btn" type="button" data-action="refresh-view">' + icon('refresh') + '刷新</button>' +
         '<a class="btn" href="#/admin">' + icon('chart') + '返回概览</a>'
     });
@@ -3080,6 +3172,8 @@
       '<button class="btn btn-accent" type="submit" id="createAccountSubmit">' + icon('plus') + '创建账户</button>' +
       '</form></section>';
 
+    var adminCards = isSuperAdmin() ? adminCreateCardHtml() + adminTableCardHtml() : '';
+
     var tableCard = '<section class="card table-card">' +
       '<div class="section-head"><div><h2 class="section-title">楼层长账户</h2>' +
       '<p class="field-hint">当前显示 ' + filtered.length + ' 个账户。删除后 72 天内可撤销删除。</p></div></div>' +
@@ -3087,7 +3181,7 @@
       accountsTableHtml(filtered) +
       '</section>';
 
-    els.view.innerHTML = pageWrap(head, createCard + tableCard);
+    els.view.innerHTML = pageWrap(head, createCard + adminCards + tableCard);
     startCountdownTicker();
   }
 
@@ -3260,6 +3354,175 @@
     }
   }
 
+  function reloadAdminAccountsData() {
+    return api.get('/api/super-admin/admins')
+      .then(function (data) {
+        state.adminAccounts = Array.isArray(data.accounts) ? data.accounts : [];
+        if (state.view === 'admin-accounts') { renderAccountsContent(); }
+      })
+      .catch(function (err) { reportError(err); });
+  }
+
+  function createAdminAccount(form) {
+    var usernameInput = q('[name="username"]', form);
+    var passwordInput = q('[name="password"]', form);
+    var displayInput = q('[name="display_name"]', form);
+    var username = usernameInput ? usernameInput.value.trim() : '';
+    var password = passwordInput ? passwordInput.value : '';
+    var displayName = displayInput ? displayInput.value.trim() : '';
+    if (!username || !password) {
+      toast('请填写管理员账户名和初始密码。', 'error');
+      if (!username && usernameInput) { usernameInput.focus(); }
+      else if (!password && passwordInput) { passwordInput.focus(); }
+      return;
+    }
+    var button = q('#createAdminSubmit', form);
+    setButtonBusy(button, true, '创建中…');
+    api.post('/api/super-admin/admins', { username: username, password: password, display_name: displayName })
+      .then(function () {
+        toast('管理员账户「' + username + '」已创建。', 'success');
+        return reloadAdminAccountsData();
+      })
+      .catch(function (err) {
+        setButtonBusy(button, false);
+        reportError(err);
+      });
+  }
+
+  function openAdminEditModal(accountId) {
+    var account = findAdminAccountById(accountId);
+    if (!account) { return; }
+    var body = '<form class="config-form" id="adminEditForm" data-account-id="' + num(account.id) + '" novalidate>' +
+      '<p class="field-hint">账户类型：' + esc(roleLabel(account.role)) + '</p>' +
+      '<div class="form-grid">' +
+      '<label class="field"><span class="field-label">账户名</span>' +
+      '<input class="input" name="username" type="text" autocomplete="off" maxlength="40" required value="' + esc(account.username) + '"></label>' +
+      '<label class="field"><span class="field-label">显示名</span>' +
+      '<input class="input" name="display_name" type="text" maxlength="40" value="' + esc(account.display_name || '') + '"></label>' +
+      '</div>' +
+      '<label class="field"><span class="field-label">重置密码（可选）</span>' +
+      '<input class="input" name="password" type="password" autocomplete="new-password" placeholder="留空则不修改密码"></label>' +
+      '<p class="field-hint">修改密码后该账户的其他登录会话将失效。</p>' +
+      '<p class="form-error" id="adminEditError" role="alert" hidden></p>' +
+      '<div class="form-actions">' +
+      '<button class="btn" type="button" data-action="close-modal">取消</button>' +
+      '<button class="btn btn-accent" type="submit" id="adminEditSubmit">保存修改</button>' +
+      '</div></form>';
+    openModal({
+      title: '编辑管理员账户',
+      eyebrow: account.username || '',
+      body: body
+    });
+  }
+
+  function saveAdminEdit(form) {
+    var accountId = Number(form.getAttribute('data-account-id'));
+    var usernameInput = q('[name="username"]', form);
+    var displayInput = q('[name="display_name"]', form);
+    var passwordInput = q('[name="password"]', form);
+    var errorEl = q('#adminEditError', form);
+    var username = usernameInput ? usernameInput.value.trim() : '';
+    var displayName = displayInput ? displayInput.value.trim() : '';
+    var password = passwordInput ? passwordInput.value : '';
+    setFieldError(errorEl, '');
+    if (!username) {
+      setFieldError(errorEl, '账户名不能为空。');
+      return;
+    }
+    var payload = { username: username, display_name: displayName };
+    if (password) { payload.password = password; }
+    var button = q('#adminEditSubmit', form);
+    setButtonBusy(button, true, '保存中…');
+    api.patch('/api/super-admin/admins/' + encodeURIComponent(String(accountId)), payload)
+      .then(function () {
+        closeTopModal();
+        toast('管理员账户已更新。', 'success');
+        return reloadAdminAccountsData();
+      })
+      .catch(function (err) {
+        setButtonBusy(button, false);
+        setFieldError(errorEl, errorMessage(err));
+        if (err.status !== 409) { reportError(err); }
+      });
+  }
+
+  function handleAdminAccountAction(action, button) {
+    var accountId = Number(button.getAttribute('data-account-id'));
+    var account = findAdminAccountById(accountId);
+    if (!account) { return; }
+    var username = account.username || '';
+
+    function request(path, body, successMessage) {
+      setButtonBusy(button, true, '处理中…');
+      api.post(path, body)
+        .then(function () {
+          toast(successMessage, 'success');
+          return reloadAdminAccountsData();
+        })
+        .catch(function (err) {
+          setButtonBusy(button, false);
+          if (err.code === 'restore_not_allowed' || err.code === 'last_super_admin') {
+            toast(errorMessage(err), 'error');
+            reloadAdminAccountsData();
+          } else {
+            reportError(err);
+          }
+        });
+    }
+
+    if (action === 'enable-admin') {
+      request('/api/super-admin/admins/' + accountId + '/enable', {}, '账户「' + username + '」已启用。');
+      return;
+    }
+    if (action === 'disable-admin') {
+      confirmDialog({
+        title: '禁用账户？',
+        message: '确认禁用管理员「' + username + '」吗？',
+        note: '禁用后该账户会立即失效全部登录会话并禁止登录；账户数据完整保留，可随时重新启用。',
+        confirmText: '禁用账户',
+        danger: true
+      }).then(function (ok) {
+        if (!ok) { return; }
+        request('/api/super-admin/admins/' + accountId + '/disable', { confirm: true },
+          '账户「' + username + '」已禁用。');
+      });
+      return;
+    }
+    if (action === 'delete-admin') {
+      confirmDialog({
+        title: '删除账户？',
+        message: '确认删除管理员「' + username + '」吗？',
+        note: '删除后账户立即禁止登录，进入 72 天保留期；期间可撤销删除。保留期到期后，系统将永久删除该账户，该操作不可恢复。',
+        confirmText: '删除账户',
+        danger: true
+      }).then(function (ok) {
+        if (!ok) { return; }
+        request('/api/super-admin/admins/' + accountId + '/delete', { confirm: true },
+          '账户「' + username + '」已删除，进入 72 天保留期。');
+      });
+      return;
+    }
+    if (action === 'restore-admin') {
+      var remaining = accountRemainingSeconds(account);
+      if (remaining <= 0) {
+        toast('该账户已超过撤销期限，无法恢复。', 'error');
+        return;
+      }
+      confirmDialog({
+        title: '撤销删除？',
+        message: '确认撤销删除管理员「' + username + '」吗？',
+        note: '剩余保留时间：' + (account.remaining_text || formatRemaining(remaining)) +
+          '。撤销后账户恢复为启用状态，全部数据保留。',
+        confirmText: '撤销删除',
+        danger: false
+      }).then(function (ok) {
+        if (!ok) { return; }
+        request('/api/super-admin/admins/' + accountId + '/restore', { confirm: true },
+          '账户「' + username + '」已恢复启用。');
+      });
+    }
+  }
+
   /* ---- 备份 ---- */
   function backupStatusBadge(status) {
     if (status === 'success') {
@@ -3301,6 +3564,9 @@
     });
     var list = backups.length ? '<div class="backup-list">' + backups.map(function (backup) {
       var canRestore = backup.status === 'success';
+      var exportButton = isSuperAdmin() ?
+        '<button class="btn btn-sm" type="button" data-action="download-backup" data-backup-id="' + num(backup.id) + '">' +
+        icon('backup') + '导出到本地</button>' : '';
       return '<div class="backup-item">' +
         '<span class="backup-icon">' + icon('backup') + '</span>' +
         '<div class="backup-info"><p class="backup-name">' + esc(backup.dir_name || '未命名备份') + '</p>' +
@@ -3308,13 +3574,15 @@
         ' · ' + esc(backup.size_text || '') + '</p></div>' +
         backupStatusBadge(backup.status) +
         '<div class="backup-actions">' +
+        exportButton +
         '<button class="btn btn-sm" type="button" data-action="restore-backup" data-backup-id="' + num(backup.id) + '"' +
         (canRestore ? '' : ' disabled') + '>' + icon('refresh') + '恢复此备份</button>' +
         '</div></div>';
     }).join('') + '</div>' :
       emptyStateCompactHtml('backup', '暂无备份', '还没有可用的系统备份，可点击“立即备份”创建第一份。');
     var card = '<section class="card"><div class="section-head"><div><h2 class="section-title">' +
-      icon('backup') + '备份记录</h2><p class="field-hint">恢复会覆盖当前数据库与图片并失效全部登录会话。</p></div>' +
+      icon('backup') + '备份记录</h2><p class="field-hint">恢复会覆盖当前数据库与图片并失效全部登录会话。' +
+      (isSuperAdmin() ? '导出会把数据库与图片打包为本地文件。' : '') + '</p></div>' +
       '<span class="badge">' + backups.length + ' 份</span></div>' + list + '</section>';
     els.view.innerHTML = pageWrap(head, card);
   }
@@ -3371,6 +3639,59 @@
           setButtonBusy(button, false);
           reportError(err);
         });
+    });
+  }
+
+  function findBackupById(backupId) {
+    for (var i = 0; i < state.backups.length; i += 1) {
+      if (Number(state.backups[i].id) === Number(backupId)) { return state.backups[i]; }
+    }
+    return null;
+  }
+
+  function responseErrorMessage(status, text) {
+    var data = null;
+    try { data = JSON.parse(text); } catch (err) { data = null; }
+    if (data && data.error && typeof data.error.message === 'string' && data.error.message) {
+      return data.error.message;
+    }
+    return '导出失败（HTTP ' + status + '）';
+  }
+
+  function downloadBackup(backup, button) {
+    if (!backup) { return; }
+    var path = '/api/super-admin/backups/' + encodeURIComponent(String(backup.id)) + '/download';
+    setButtonBusy(button, true, '导出中…');
+    window.fetch(path, {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: { 'X-CSRF-Token': api.getCsrf() }
+    }).then(function (response) {
+      if (!response.ok) {
+        return response.text().then(function (text) {
+          var err = { status: response.status, message: responseErrorMessage(response.status, text) };
+          if (response.status === 401) {
+            handleUnauthorized();
+            return;
+          }
+          throw err;
+        });
+      }
+      return response.blob().then(function (blob) {
+        var objectUrl = window.URL.createObjectURL(blob);
+        var link = document.createElement('a');
+        link.href = objectUrl;
+        link.download = (backup.dir_name || 'backup') + '.tar';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        window.setTimeout(function () { window.URL.revokeObjectURL(objectUrl); }, 2000);
+        toast('备份已导出：' + link.download, 'success');
+      });
+    }).catch(function (err) {
+      reportError(err);
+    }).then(function () {
+      setButtonBusy(button, false);
     });
   }
 
@@ -3813,8 +4134,20 @@
       case 'restore-account':
         handleAccountAction(action, actionEl);
         break;
+      case 'edit-admin':
+        openAdminEditModal(Number(actionEl.getAttribute('data-account-id')));
+        break;
+      case 'enable-admin':
+      case 'disable-admin':
+      case 'delete-admin':
+      case 'restore-admin':
+        handleAdminAccountAction(action, actionEl);
+        break;
       case 'immediate-backup':
         handleBackupNow(actionEl);
+        break;
+      case 'download-backup':
+        downloadBackup(findBackupById(actionEl.getAttribute('data-backup-id')), actionEl);
         break;
       case 'restore-backup':
         restoreBackup(actionEl, actionEl.getAttribute('data-backup-id'));
@@ -3870,6 +4203,12 @@
         break;
       case 'accountEditForm':
         saveAccountEdit(form);
+        break;
+      case 'createAdminForm':
+        createAdminAccount(form);
+        break;
+      case 'adminEditForm':
+        saveAdminEdit(form);
         break;
       case 'logFilterForm':
         applyLogFilters(form);

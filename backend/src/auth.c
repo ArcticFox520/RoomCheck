@@ -22,11 +22,14 @@ static void account_from_row(sqlite3_stmt *st, account_t *out)
     out->last_login_at = db_col_i64(st, 7);
     out->deleted_at = db_col_i64(st, 8);
     out->delete_at = db_col_i64(st, 9);
+    out->super_admin = sqlite3_column_int(st, 10);
+    if (out->super_admin && strcmp(out->role, "admin") == 0)
+        snprintf(out->role, sizeof(out->role), "%s", "super_admin");
 }
 
 static const char *k_account_cols =
     "id, role, username, display_name, must_change_password, status, created_at, "
-    "last_login_at, deleted_at, delete_at";
+    "last_login_at, deleted_at, delete_at, super_admin";
 
 int auth_find_account(const char *username, account_t *out)
 {
@@ -69,7 +72,8 @@ int auth_load_account(int64_t id, account_t *out)
 
 int auth_role_is_admin(request_t *r)
 {
-    return r && r->authed && strcmp(r->role, "admin") == 0;
+    return r && r->authed &&
+           (strcmp(r->role, "admin") == 0 || strcmp(r->role, "super_admin") == 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -123,7 +127,7 @@ int auth_validate_session(const char *token, account_t *out, char *csrf_out,
     const char *sql =
         "SELECT s.account_id, s.role, s.csrf_token, s.expires_at, s.revoked, "
         "a.id, a.role, a.username, a.display_name, a.must_change_password, a.status, "
-        "a.created_at, a.last_login_at, a.deleted_at, a.delete_at "
+        "a.created_at, a.last_login_at, a.deleted_at, a.delete_at, a.super_admin "
         "FROM session s JOIN account a ON a.id=s.account_id WHERE s.token_hash=?1";
     int ok = 0;
     if (db_prepare(sql, &st) == 0) {
@@ -139,12 +143,18 @@ int auth_validate_session(const char *token, account_t *out, char *csrf_out,
             const char *display_name = db_col_text(st, 8);
             int must_change = sqlite3_column_int(st, 9);
             const char *status = db_col_text(st, 10);
+            int super_admin = sqlite3_column_int(st, 15);
+            char effective_role[16];
+            snprintf(effective_role, sizeof(effective_role), "%s", acct_role);
+            if (super_admin && strcmp(acct_role, "admin") == 0)
+                snprintf(effective_role, sizeof(effective_role), "%s", "super_admin");
             int64_t now = rc_now();
             if (!revoked && expires > now && strcmp(status, "enabled") == 0 &&
-                strcmp(sess_role, acct_role) == 0) {
+                strcmp(sess_role, effective_role) == 0) {
                 memset(out, 0, sizeof(*out));
                 out->id = account_id;
-                snprintf(out->role, sizeof(out->role), "%s", acct_role);
+                out->super_admin = super_admin;
+                snprintf(out->role, sizeof(out->role), "%s", effective_role);
                 snprintf(out->username, sizeof(out->username), "%s", username);
                 snprintf(out->display_name, sizeof(out->display_name), "%s", display_name);
                 out->must_change_password = must_change;
@@ -328,33 +338,79 @@ static int count_admins(void)
     return n;
 }
 
+static int primary_admin(int64_t *id_out, char *username_out, size_t username_sz)
+{
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    if (db_prepare("SELECT id, username FROM account WHERE role='admin' "
+                   "ORDER BY super_admin DESC, id LIMIT 1",
+                   &st) == 0) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            if (id_out)
+                *id_out = db_col_i64(st, 0);
+            if (username_out)
+                snprintf(username_out, username_sz, "%s", db_col_text(st, 1));
+            found = 1;
+        }
+        sqlite3_finalize(st);
+    }
+    return found;
+}
+
+int auth_ensure_super_admin(void)
+{
+    sqlite3_stmt *st = NULL;
+    int has_super_admin = 0;
+    if (db_prepare("SELECT COUNT(*) FROM account WHERE role='admin' AND super_admin=1",
+                   &st) != 0)
+        return -1;
+    if (sqlite3_step(st) == SQLITE_ROW)
+        has_super_admin = sqlite3_column_int(st, 0) > 0;
+    sqlite3_finalize(st);
+    if (has_super_admin)
+        return 0;
+
+    int64_t admin_id = 0;
+    if (!primary_admin(&admin_id, NULL, 0))
+        return 0;
+    if (db_prepare("UPDATE account SET super_admin=1, updated_at=?1 "
+                   "WHERE id=?2 AND role='admin'",
+                   &st) != 0)
+        return -1;
+    db_bind_i64(st, 1, rc_now());
+    db_bind_i64(st, 2, admin_id);
+    int rc = db_step_done(st);
+    sqlite3_finalize(st);
+    if (rc != 0)
+        return -1;
+    auth_revoke_all_sessions(admin_id, NULL);
+    return 0;
+}
+
 int auth_ensure_admin(void)
 {
+    if (auth_ensure_super_admin() != 0) {
+        fprintf(stderr, "初始化超级管理员失败: %s\n", db_error());
+        return -1;
+    }
     const char *reset_env = getenv("ADMIN_RESET");
     int do_reset = reset_env && strcmp(reset_env, "1") == 0;
     int admins = count_admins();
     if (admins > 0 && !do_reset)
         return 0;
 
-    account_t existing;
-    memset(&existing, 0, sizeof(existing));
-    int has_existing = 0;
-    if (admins > 0) {
-        sqlite3_stmt *st = NULL;
-        if (db_prepare("SELECT username FROM account WHERE role='admin' ORDER BY id LIMIT 1",
-                       &st) == 0) {
-            if (sqlite3_step(st) == SQLITE_ROW) {
-                snprintf(existing.username, sizeof(existing.username), "%s",
-                         db_col_text(st, 0));
-                has_existing = 1;
-            }
-            sqlite3_finalize(st);
-        }
+    int64_t existing_id = 0;
+    char existing_username[128] = "";
+    int has_existing = admins > 0 &&
+                       primary_admin(&existing_id, existing_username, sizeof(existing_username));
+    if (admins > 0 && !has_existing) {
+        fprintf(stderr, "读取管理员账户失败: %s\n", db_error());
+        return -1;
     }
 
     char username[128];
     if (has_existing)
-        snprintf(username, sizeof(username), "%s", existing.username);
+        snprintf(username, sizeof(username), "%s", existing_username);
     else
         snprintf(username, sizeof(username), "admin");
 
@@ -375,28 +431,22 @@ int auth_ensure_admin(void)
     if (has_existing) {
         sqlite3_stmt *st = NULL;
         if (db_prepare("UPDATE account SET password_hash=?1, must_change_password=1, "
-                       "status='enabled', deleted_at=NULL, delete_at=NULL, updated_at=?2 "
-                       "WHERE role='admin' AND username_norm=?3",
+                       "status='enabled', deleted_at=NULL, delete_at=NULL, super_admin=1, "
+                       "updated_at=?2 WHERE id=?3",
                        &st) == 0) {
             db_bind_text(st, 1, hash);
             db_bind_i64(st, 2, now);
-            db_bind_text(st, 3, norm);
+            db_bind_i64(st, 3, existing_id);
             ok = db_step_done(st) == 0;
             sqlite3_finalize(st);
         }
-        if (ok) {
-            sqlite3_stmt *q = NULL;
-            if (db_prepare("SELECT id FROM account WHERE role='admin' LIMIT 1", &q) == 0) {
-                if (sqlite3_step(q) == SQLITE_ROW)
-                    auth_revoke_all_sessions(db_col_i64(q, 0), NULL);
-                sqlite3_finalize(q);
-            }
-        }
+        if (ok)
+            auth_revoke_all_sessions(existing_id, NULL);
     } else {
         sqlite3_stmt *st = NULL;
         if (db_prepare("INSERT INTO account(role, username, username_norm, password_hash, "
-                       "must_change_password, status, display_name, created_at, updated_at) "
-                       "VALUES('admin',?1,?2,?3,1,'enabled','系统管理员',?4,?4)",
+                       "must_change_password, status, display_name, created_at, updated_at, "
+                       "super_admin) VALUES('admin',?1,?2,?3,1,'enabled','系统管理员',?4,?4,1)",
                        &st) == 0) {
             db_bind_text(st, 1, username);
             db_bind_text(st, 2, norm);

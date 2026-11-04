@@ -6,13 +6,9 @@
 
 #include <ctype.h>
 
-static void week_label(int64_t week_start, char *out, size_t outsz)
+static void week_label(int64_t week_start, int64_t week_end, char *out, size_t outsz)
 {
-    int iso_year = 0, iso_week = 0;
-    if (rc_iso_week(week_start, &iso_year, &iso_week))
-        snprintf(out, outsz, "%d 年第 %d 周", iso_year, iso_week);
-    else
-        out[0] = '\0';
+    rc_fmt_week_range(week_start, week_end, out, outsz);
 }
 
 static void base_account_fields(jw_t *w, const account_t *a)
@@ -20,7 +16,7 @@ static void base_account_fields(jw_t *w, const account_t *a)
     jw_key(w, "id");
     jw_i64(w, a->id);
     jw_key(w, "role");
-    jw_str(w, "floor_manager");
+    jw_str(w, a->role);
     jw_key(w, "username");
     jw_str(w, a->username);
     jw_key(w, "display_name");
@@ -118,7 +114,7 @@ static void account_summary_json(jw_t *w, const account_t *a, int64_t filter_dat
         rc_fmt_date(week.week_end, text, sizeof(text));
         jw_str(w, text);
         jw_key(w, "label");
-        week_label(week.week_start, text, sizeof(text));
+        week_label(week.week_start, week.week_end, text, sizeof(text));
         jw_str(w, text);
         jw_key(w, "plan_type");
         jw_str(w, week.plan_type);
@@ -165,6 +161,35 @@ static int load_manager_target(request_t *r, account_t *out, char *err_msg, size
 {
     char code[64];
     return target_account(r, out, code, sizeof(code), err_msg, em_sz);
+}
+
+static int load_admin_target(request_t *r, account_t *out, char *err_msg, size_t em_sz)
+{
+    int64_t id = 0;
+    if (!req_param_i64(r, 0, &id) || id <= 0 || !auth_load_account(id, out)) {
+        snprintf(err_msg, em_sz, "账户不存在");
+        return 0;
+    }
+    if (strcmp(out->role, "admin") != 0 && strcmp(out->role, "super_admin") != 0) {
+        snprintf(err_msg, em_sz, "目标账户不是管理员");
+        return 0;
+    }
+    return 1;
+}
+
+static int other_enabled_super_admins(int64_t exclude_id)
+{
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (db_prepare("SELECT COUNT(*) FROM account WHERE role='admin' AND super_admin=1 "
+                   "AND status='enabled' AND id<>?1",
+                   &st) == 0) {
+        db_bind_i64(st, 1, exclude_id);
+        if (sqlite3_step(st) == SQLITE_ROW)
+            n = sqlite3_column_int(st, 0);
+        sqlite3_finalize(st);
+    }
+    return n;
 }
 
 static int validate_new_username(request_t *r, const char *raw, int64_t exclude_id,
@@ -680,6 +705,462 @@ void h_admin_account_week(request_t *r)
     jw_free(&w);
 }
 
+void h_admin_admins(request_t *r)
+{
+    sqlite3_stmt *st = NULL;
+    const char *sql =
+        "SELECT id, role, username, display_name, must_change_password, status, created_at, "
+        "last_login_at, deleted_at, delete_at, super_admin FROM account WHERE role='admin' "
+        "ORDER BY super_admin DESC, id";
+    if (db_prepare(sql, &st) != 0) {
+        resp_error(r, 500, "server_error", "读取管理员账户列表失败");
+        return;
+    }
+    jw_t w;
+    jw_init(&w);
+    jw_obj(&w);
+    jw_key(&w, "accounts");
+    jw_arr(&w);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        account_t a;
+        memset(&a, 0, sizeof(a));
+        a.id = db_col_i64(st, 0);
+        snprintf(a.role, sizeof(a.role), "%s", db_col_text(st, 1));
+        snprintf(a.username, sizeof(a.username), "%s", db_col_text(st, 2));
+        snprintf(a.display_name, sizeof(a.display_name), "%s", db_col_text(st, 3));
+        a.must_change_password = sqlite3_column_int(st, 4);
+        snprintf(a.status, sizeof(a.status), "%s", db_col_text(st, 5));
+        a.created_at = db_col_i64(st, 6);
+        a.last_login_at = db_col_i64(st, 7);
+        a.deleted_at = db_col_i64(st, 8);
+        a.delete_at = db_col_i64(st, 9);
+        a.super_admin = sqlite3_column_int(st, 10);
+        if (a.super_admin && strcmp(a.role, "admin") == 0)
+            snprintf(a.role, sizeof(a.role), "%s", "super_admin");
+        brief_account_json(&w, &a);
+    }
+    sqlite3_finalize(st);
+    jw_end(&w);
+    jw_end(&w);
+    char *json = sb_steal(&w.b);
+    resp_json(r, 200, json);
+    free(json);
+    jw_free(&w);
+}
+
+void h_admin_admin_create(request_t *r)
+{
+    jval_t *body = req_json(r);
+    if (!body)
+        return;
+    const char *username = json_get_str(body, "username");
+    const char *password = json_get_str(body, "password");
+    const char *display_name = json_get_str(body, "display_name");
+    if (!username || !password || !*password || strlen(password) > 256) {
+        json_free(body);
+        resp_error(r, 400, "invalid_request", "请填写账户名和密码");
+        return;
+    }
+    char name[128], err[256] = "";
+    int v = validate_new_username(r, username, 0, name, sizeof(name), err, sizeof(err));
+    if (v != 1) {
+        json_free(body);
+        resp_error(r, v == -1 ? 409 : 422, v == -1 ? "username_taken" : "invalid_username",
+                   "%s", err);
+        return;
+    }
+    char display[128] = "";
+    if (display_name) {
+        char *tmp = trim_dup(display_name);
+        if (utf8_count(tmp) > 40) {
+            free(tmp);
+            json_free(body);
+            resp_error(r, 422, "invalid_display_name", "显示名最多 40 个字符");
+            return;
+        }
+        snprintf(display, sizeof(display), "%s", tmp);
+        free(tmp);
+    }
+    char *norm = lower_dup(name);
+    char *hash = password_hash(password);
+    int64_t now = rc_now();
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    int64_t id = 0;
+    if (db_prepare("INSERT INTO account(role, username, username_norm, password_hash, "
+                   "must_change_password, status, display_name, created_at, updated_at, "
+                   "super_admin) VALUES('admin',?1,?2,?3,0,'enabled',?4,?5,?5,0)",
+                   &st) == 0) {
+        db_bind_text(st, 1, name);
+        db_bind_text(st, 2, norm);
+        db_bind_text(st, 3, hash);
+        db_bind_text(st, 4, display);
+        db_bind_i64(st, 5, now);
+        ok = db_step_done(st) == 0;
+        if (ok)
+            id = db_last_id();
+        sqlite3_finalize(st);
+    }
+    free(norm);
+    secure_wipe(hash, strlen(hash));
+    free(hash);
+    if (!ok) {
+        json_free(body);
+        resp_error(r, 500, "account_create_failed", "创建管理员失败");
+        return;
+    }
+    account_t a;
+    auth_load_account(id, &a);
+    jw_t w;
+    jw_init(&w);
+    jw_obj(&w);
+    jw_key(&w, "account");
+    brief_account_json(&w, &a);
+    jw_end(&w);
+    char *json = sb_steal(&w.b);
+    resp_json(r, 201, json);
+    free(json);
+    jw_free(&w);
+    audit_req(r, "account_create", "account", "", "success", "创建管理员 %s", name);
+    json_free(body);
+}
+
+void h_admin_admin_update(request_t *r)
+{
+    jval_t *body = req_json(r);
+    if (!body)
+        return;
+    account_t target;
+    char err[256] = "";
+    if (!load_admin_target(r, &target, err, sizeof(err))) {
+        json_free(body);
+        resp_error(r, 404, "not_found", "%s", err);
+        return;
+    }
+    if (strcmp(target.status, "deleted") == 0) {
+        json_free(body);
+        resp_error(r, 409, "account_deleted", "已删除账户不能修改");
+        return;
+    }
+    const char *new_username = json_get_str(body, "username");
+    const char *new_password = json_get_str(body, "password");
+    const char *new_display = json_get_str(body, "display_name");
+    if (!new_username && !new_password && !new_display) {
+        json_free(body);
+        resp_error(r, 400, "invalid_request", "没有要修改的字段");
+        return;
+    }
+    char name[128];
+    snprintf(name, sizeof(name), "%s", target.username);
+    if (new_username) {
+        int v = validate_new_username(r, new_username, target.id, name, sizeof(name), err,
+                                      sizeof(err));
+        if (v != 1) {
+            json_free(body);
+            resp_error(r, v == -1 ? 409 : 422, v == -1 ? "username_taken" : "invalid_username",
+                       "%s", err);
+            return;
+        }
+    }
+    char display[128];
+    snprintf(display, sizeof(display), "%s", target.display_name);
+    if (new_display) {
+        char *tmp = trim_dup(new_display);
+        if (utf8_count(tmp) > 40) {
+            free(tmp);
+            json_free(body);
+            resp_error(r, 422, "invalid_display_name", "显示名最多 40 个字符");
+            return;
+        }
+        snprintf(display, sizeof(display), "%s", tmp);
+        free(tmp);
+    }
+    if (new_password && (!*new_password || strlen(new_password) > 256)) {
+        json_free(body);
+        resp_error(r, 422, "invalid_password", "密码不能为空且最多 256 字节");
+        return;
+    }
+    char *norm = lower_dup(name);
+    char *hash = new_password ? password_hash(new_password) : NULL;
+    int64_t now = rc_now();
+    int ok = 0;
+    sqlite3_stmt *st = NULL;
+    if (hash) {
+        if (db_prepare("UPDATE account SET username=?1, username_norm=?2, display_name=?3, "
+                       "password_hash=?4, must_change_password=0, updated_at=?5 WHERE id=?6",
+                       &st) == 0) {
+            db_bind_text(st, 1, name);
+            db_bind_text(st, 2, norm);
+            db_bind_text(st, 3, display);
+            db_bind_text(st, 4, hash);
+            db_bind_i64(st, 5, now);
+            db_bind_i64(st, 6, target.id);
+            ok = db_step_done(st) == 0;
+            sqlite3_finalize(st);
+        }
+    } else {
+        if (db_prepare("UPDATE account SET username=?1, username_norm=?2, display_name=?3, "
+                       "updated_at=?4 WHERE id=?5",
+                       &st) == 0) {
+            db_bind_text(st, 1, name);
+            db_bind_text(st, 2, norm);
+            db_bind_text(st, 3, display);
+            db_bind_i64(st, 4, now);
+            db_bind_i64(st, 5, target.id);
+            ok = db_step_done(st) == 0;
+            sqlite3_finalize(st);
+        }
+    }
+    free(norm);
+    if (hash) {
+        secure_wipe(hash, strlen(hash));
+        free(hash);
+    }
+    if (!ok) {
+        json_free(body);
+        resp_error(r, 500, "account_update_failed", "修改账户失败");
+        return;
+    }
+    if (new_password)
+        auth_revoke_all_sessions(target.id, NULL);
+    account_t updated;
+    auth_load_account(target.id, &updated);
+    jw_t w;
+    jw_init(&w);
+    jw_obj(&w);
+    jw_key(&w, "account");
+    brief_account_json(&w, &updated);
+    jw_end(&w);
+    char *json = sb_steal(&w.b);
+    resp_json(r, 200, json);
+    free(json);
+    jw_free(&w);
+    audit_req(r, "account_update", "account", "", "success",
+              "修改管理员账户 %s（用户名=%s，显示名=%s，重置密码=%s）", target.username,
+              name, display, new_password ? "是" : "否");
+    json_free(body);
+}
+
+void h_admin_admin_enable(request_t *r)
+{
+    account_t target;
+    char err[256] = "";
+    if (!load_admin_target(r, &target, err, sizeof(err))) {
+        resp_error(r, 404, "not_found", "%s", err);
+        return;
+    }
+    if (strcmp(target.status, "deleted") == 0) {
+        resp_error(r, 409, "account_deleted", "已删除账户请使用撤销删除恢复");
+        return;
+    }
+    if (strcmp(target.status, "enabled") == 0) {
+        status_change_response(r, target.id, 200);
+        return;
+    }
+    sqlite3_stmt *st = NULL;
+    if (db_prepare("UPDATE account SET status='enabled', updated_at=?1 WHERE id=?2", &st) != 0) {
+        resp_error(r, 500, "account_enable_failed", "启用账户失败");
+        return;
+    }
+    db_bind_i64(st, 1, rc_now());
+    db_bind_i64(st, 2, target.id);
+    int rc = db_step_done(st);
+    sqlite3_finalize(st);
+    if (rc != 0) {
+        resp_error(r, 500, "account_enable_failed", "启用账户失败");
+        return;
+    }
+    auth_record_login_success(target.username);
+    audit_req(r, "account_enable", "account", "", "success", "启用管理员 %s", target.username);
+    status_change_response(r, target.id, 200);
+}
+
+void h_admin_admin_disable(request_t *r)
+{
+    jval_t *body = req_json(r);
+    if (!body)
+        return;
+    if (!json_get_bool(body, "confirm", 0)) {
+        json_free(body);
+        resp_error(r, 400, "confirm_required", "禁用账户需要二次确认");
+        return;
+    }
+    account_t target;
+    char err[256] = "";
+    if (!load_admin_target(r, &target, err, sizeof(err))) {
+        json_free(body);
+        resp_error(r, 404, "not_found", "%s", err);
+        return;
+    }
+    if (strcmp(target.status, "deleted") == 0) {
+        json_free(body);
+        resp_error(r, 409, "account_deleted", "已删除账户不能禁用");
+        return;
+    }
+    if (strcmp(target.status, "disabled") == 0) {
+        json_free(body);
+        status_change_response(r, target.id, 200);
+        return;
+    }
+    if (strcmp(target.role, "super_admin") == 0 &&
+        other_enabled_super_admins(target.id) == 0) {
+        json_free(body);
+        resp_error(r, 409, "last_super_admin", "不能禁用最后一个可用超级管理员");
+        return;
+    }
+    sqlite3_stmt *st = NULL;
+    if (db_prepare("UPDATE account SET status='disabled', updated_at=?1 WHERE id=?2", &st) != 0) {
+        json_free(body);
+        resp_error(r, 500, "account_disable_failed", "禁用账户失败");
+        return;
+    }
+    db_bind_i64(st, 1, rc_now());
+    db_bind_i64(st, 2, target.id);
+    int rc = db_step_done(st);
+    sqlite3_finalize(st);
+    if (rc != 0) {
+        json_free(body);
+        resp_error(r, 500, "account_disable_failed", "禁用账户失败");
+        return;
+    }
+    auth_revoke_all_sessions(target.id, NULL);
+    audit_req(r, "account_disable", "account", "", "success",
+              "禁用管理员 %s，保留全部业务数据", target.username);
+    json_free(body);
+    status_change_response(r, target.id, 200);
+}
+
+void h_admin_admin_delete(request_t *r)
+{
+    jval_t *body = req_json(r);
+    if (!body)
+        return;
+    if (!json_get_bool(body, "confirm", 0)) {
+        json_free(body);
+        resp_error(r, 400, "confirm_required", "删除账户需要二次确认");
+        return;
+    }
+    account_t target;
+    char err[256] = "";
+    if (!load_admin_target(r, &target, err, sizeof(err))) {
+        json_free(body);
+        resp_error(r, 404, "not_found", "%s", err);
+        return;
+    }
+    if (strcmp(target.status, "deleted") == 0) {
+        json_free(body);
+        resp_error(r, 409, "account_already_deleted", "账户已处于删除状态");
+        return;
+    }
+    if (strcmp(target.role, "super_admin") == 0 &&
+        other_enabled_super_admins(target.id) == 0) {
+        json_free(body);
+        resp_error(r, 409, "last_super_admin", "不能删除最后一个可用超级管理员");
+        return;
+    }
+    int64_t now = rc_now();
+    int64_t delete_at = now + RC_DELETE_SECONDS;
+    sqlite3_stmt *st = NULL;
+    if (db_prepare("UPDATE account SET status='deleted', deleted_at=?1, delete_at=?2, "
+                   "updated_at=?1 WHERE id=?3 AND status IN ('enabled','disabled')",
+                   &st) != 0) {
+        json_free(body);
+        resp_error(r, 500, "account_delete_failed", "删除账户失败");
+        return;
+    }
+    db_bind_i64(st, 1, now);
+    db_bind_i64(st, 2, delete_at);
+    db_bind_i64(st, 3, target.id);
+    int rc = db_step_done(st);
+    int changed = db_changes();
+    sqlite3_finalize(st);
+    if (rc != 0 || changed == 0) {
+        json_free(body);
+        resp_error(r, 500, "account_delete_failed", "删除账户失败");
+        return;
+    }
+    auth_revoke_all_sessions(target.id, NULL);
+    audit_req(r, "account_delete", "account", "", "success",
+              "删除管理员 %s，立即禁止登录，数据保留 72 天（至 %lld）", target.username,
+              (long long)delete_at);
+    json_free(body);
+    status_change_response(r, target.id, 200);
+}
+
+void h_admin_admin_restore(request_t *r)
+{
+    jval_t *body = req_json(r);
+    if (!body)
+        return;
+    if (!json_get_bool(body, "confirm", 0)) {
+        json_free(body);
+        resp_error(r, 400, "confirm_required", "撤销删除需要二次确认");
+        return;
+    }
+    account_t target;
+    char err[256] = "";
+    if (!load_admin_target(r, &target, err, sizeof(err))) {
+        json_free(body);
+        resp_error(r, 404, "not_found", "%s", err);
+        return;
+    }
+    if (strcmp(target.status, "deleted") != 0) {
+        json_free(body);
+        resp_error(r, 409, "restore_not_allowed", "账户未处于删除状态");
+        return;
+    }
+    int64_t now = rc_now();
+    if (target.delete_at <= now) {
+        json_free(body);
+        resp_error(r, 409, "restore_not_allowed", "已到永久删除时间，无法撤销删除");
+        return;
+    }
+    sqlite3_stmt *task = NULL;
+    if (db_prepare("SELECT status FROM deletion_task WHERE account_id=?1", &task) == 0) {
+        db_bind_i64(task, 1, target.id);
+        if (sqlite3_step(task) == SQLITE_ROW) {
+            const char *ts = db_col_text(task, 0);
+            if (strcmp(ts, "processing") == 0 || strcmp(ts, "done") == 0) {
+                sqlite3_finalize(task);
+                json_free(body);
+                resp_error(r, 409, "restore_not_allowed", "永久删除已开始，无法撤销");
+                return;
+            }
+        }
+        sqlite3_finalize(task);
+    }
+    sqlite3_stmt *st = NULL;
+    if (db_prepare("UPDATE account SET status='enabled', deleted_at=NULL, delete_at=NULL, "
+                   "updated_at=?1 WHERE id=?2 AND status='deleted' AND delete_at>?3",
+                   &st) != 0) {
+        json_free(body);
+        resp_error(r, 500, "restore_failed", "撤销删除失败");
+        return;
+    }
+    db_bind_i64(st, 1, now);
+    db_bind_i64(st, 2, target.id);
+    db_bind_i64(st, 3, now);
+    int rc = db_step_done(st);
+    int changed = db_changes();
+    sqlite3_finalize(st);
+    if (rc != 0 || changed == 0) {
+        json_free(body);
+        resp_error(r, 409, "restore_not_allowed", "撤销删除失败，账户状态已变化");
+        return;
+    }
+    if (db_prepare("DELETE FROM deletion_task WHERE account_id=?1", &st) == 0) {
+        db_bind_i64(st, 1, target.id);
+        db_step_done(st);
+        sqlite3_finalize(st);
+    }
+    auth_record_login_success(target.username);
+    audit_req(r, "account_restore", "account", "", "success",
+              "撤销删除管理员 %s（原删除时间 %lld），恢复为启用状态", target.username,
+              (long long)target.deleted_at);
+    json_free(body);
+    status_change_response(r, target.id, 200);
+}
+
 void h_admin_overview(request_t *r)
 {
     int64_t filter_date = 0;
@@ -1088,6 +1569,41 @@ void h_admin_backup_restore(request_t *r)
     free(json);
     jw_free(&w);
     json_free(body);
+}
+
+void h_admin_backup_export(request_t *r)
+{
+    const char *csrf = req_header(r, "X-CSRF-Token");
+    if (!csrf || !secure_eq(csrf, r->csrf_token)) {
+        resp_error(r, 403, "csrf_invalid", "CSRF 校验失败，请刷新页面后重试");
+        return;
+    }
+    int64_t backup_id = 0;
+    if (!req_param_i64(r, 0, &backup_id) || backup_id <= 0) {
+        resp_error(r, 400, "invalid_backup", "备份参数错误");
+        return;
+    }
+    strbuf_t archive;
+    sb_init(&archive);
+    char file_name[160] = "", err[512] = "";
+    int rc = backup_export_archive(backup_id, &archive, file_name, sizeof(file_name), err,
+                                   sizeof(err));
+    if (rc != 0) {
+        audit_req(r, "backup_export", "backup", "", "failure", "导出备份失败：%s", err);
+        sb_free(&archive);
+        resp_error(r, rc == -1 ? 404 : 500, rc == -1 ? "not_found" : "backup_export_failed",
+                   "%s", err);
+        return;
+    }
+    audit_req(r, "backup_export", "backup", file_name, "success", "导出备份文件 %s",
+              file_name);
+    sb_free(&r->out);
+    r->out = archive;
+    r->status = 200;
+    r->no_store = 1;
+    snprintf(r->content_type, sizeof(r->content_type), "application/x-tar");
+    snprintf(r->extra_headers, sizeof(r->extra_headers),
+             "Content-Disposition: attachment; filename=\"%s\"\r\n", file_name);
 }
 
 /* ------------------------------------------------------------------ */

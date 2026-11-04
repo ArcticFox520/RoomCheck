@@ -272,6 +272,296 @@ static int unlink_if_exists(const char *path)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* verified backup export (tar archive for local download)             */
+/* ------------------------------------------------------------------ */
+static int64_t path_mtime(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) == 0)
+        return (int64_t)st.st_mtime;
+    return rc_now();
+}
+
+static void tar_octal(char *field, size_t width, int64_t value)
+{
+    size_t digits = width - 1;
+    for (size_t i = digits; i > 0; i--) {
+        field[i - 1] = (char)('0' + (value & 7));
+        value >>= 3;
+    }
+    field[digits] = '\0';
+}
+
+static int tar_header(strbuf_t *out, const char *name, char type, int64_t size, int64_t mtime,
+                      char *err, size_t errsz)
+{
+    if (!name || !*name || strlen(name) >= 100) {
+        snprintf(err, errsz, "备份文件路径过长");
+        return -1;
+    }
+    if (size < 0 || size > 077777777777LL) {
+        snprintf(err, errsz, "备份文件过大，无法导出");
+        return -1;
+    }
+    unsigned char hdr[512];
+    memset(hdr, 0, sizeof(hdr));
+    memcpy(hdr, name, strlen(name));
+    tar_octal((char *)hdr + 100, 8, 0644);
+    tar_octal((char *)hdr + 108, 8, 0);
+    tar_octal((char *)hdr + 116, 8, 0);
+    tar_octal((char *)hdr + 124, 12, size);
+    tar_octal((char *)hdr + 136, 12, mtime);
+    memset(hdr + 148, ' ', 8);
+    hdr[156] = (unsigned char)type;
+    memcpy(hdr + 257, "ustar", 6);
+    memcpy(hdr + 263, "00", 2);
+    memcpy(hdr + 265, "root", 4);
+    memcpy(hdr + 297, "root", 4);
+    unsigned int sum = 0;
+    for (size_t i = 0; i < sizeof(hdr); i++)
+        sum += hdr[i];
+    char chk[8];
+    snprintf(chk, sizeof(chk), "%06o", sum);
+    memcpy(hdr + 148, chk, 6);
+    hdr[154] = '\0';
+    hdr[155] = ' ';
+    sb_putn(out, (const char *)hdr, sizeof(hdr));
+    return 0;
+}
+
+static int tar_add_file(strbuf_t *out, const char *archive_name, const char *fs_path,
+                        char *err, size_t errsz)
+{
+    char *data = NULL;
+    size_t len = 0;
+    if (file_read(fs_path, &data, &len) != 0) {
+        snprintf(err, errsz, "读取备份文件失败: %s", archive_name);
+        return -1;
+    }
+    int rc = tar_header(out, archive_name, '0', (int64_t)len, path_mtime(fs_path), err, errsz);
+    if (rc == 0) {
+        sb_putn(out, data, len);
+        size_t pad = (512 - (len % 512)) % 512;
+        if (pad > 0) {
+            static const char zeros[512] = {0};
+            sb_putn(out, zeros, pad);
+        }
+    }
+    free(data);
+    return rc;
+}
+
+static int tar_add_tree(strbuf_t *out, const char *fs_path, const char *archive_path,
+                        char *err, size_t errsz)
+{
+    struct stat st;
+    if (stat(fs_path, &st) != 0) {
+        snprintf(err, errsz, "读取备份目录失败: %s", archive_path);
+        return -1;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        char dir_name[256];
+        int n = snprintf(dir_name, sizeof(dir_name), "%s/", archive_path);
+        if (n < 0 || (size_t)n >= sizeof(dir_name) ||
+            tar_header(out, dir_name, '5', 0, path_mtime(fs_path), err, errsz) != 0)
+            return -1;
+        char **names = NULL;
+        int count = 0;
+        if (dir_list(fs_path, &names, &count, -1) != 0) {
+            snprintf(err, errsz, "读取备份目录失败: %s", archive_path);
+            return -1;
+        }
+        int rc = 0;
+        for (int i = 0; i < count; i++) {
+            char *child_fs = path_join(fs_path, names[i]);
+            char *child_archive = path_join(archive_path, names[i]);
+            if (tar_add_tree(out, child_fs, child_archive, err, errsz) != 0)
+                rc = -1;
+            free(child_fs);
+            free(child_archive);
+            free(names[i]);
+            if (rc != 0)
+                break;
+        }
+        free(names);
+        return rc;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        snprintf(err, errsz, "备份包含不支持的文件类型: %s", archive_path);
+        return -1;
+    }
+    return tar_add_file(out, archive_path, fs_path, err, errsz);
+}
+
+static int verify_backup_database(const char *db_path, const char *uploads_path, char *err,
+                                  size_t errsz)
+{
+    sqlite3 *verify = NULL;
+    if (sqlite3_open_v2(db_path, &verify, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        snprintf(err, errsz, "无法打开备份数据库");
+        if (verify)
+            sqlite3_close(verify);
+        return -1;
+    }
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(verify, "PRAGMA integrity_check", -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW &&
+            strcmp((const char *)sqlite3_column_text(st, 0), "ok") == 0)
+            ok = 1;
+        sqlite3_finalize(st);
+    }
+    if (!ok) {
+        sqlite3_close(verify);
+        snprintf(err, errsz, "备份数据库完整性校验失败");
+        return -1;
+    }
+    if (sqlite3_prepare_v2(verify, "SELECT COUNT(*) FROM account", -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) != SQLITE_ROW)
+            ok = 0;
+        sqlite3_finalize(st);
+    } else {
+        ok = 0;
+    }
+    if (ok) {
+        if (sqlite3_prepare_v2(verify, "SELECT rel_path FROM note_image", -1, &st, NULL) ==
+            SQLITE_OK) {
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                const char *rel = (const char *)sqlite3_column_text(st, 0);
+                if (!rel || !path_is_safe(rel)) {
+                    ok = 0;
+                    break;
+                }
+                char *image = path_join(uploads_path, rel);
+                if (!file_exists(image))
+                    ok = 0;
+                free(image);
+                if (!ok)
+                    break;
+            }
+            sqlite3_finalize(st);
+        } else {
+            ok = 0;
+        }
+    }
+    sqlite3_close(verify);
+    if (!ok) {
+        snprintf(err, errsz, "备份数据库或图片文件不完整");
+        return -1;
+    }
+    return 0;
+}
+
+int backup_export_archive(int64_t backup_id, strbuf_t *out, char *file_name, size_t fname_sz,
+                          char *err, size_t errsz)
+{
+    sqlite3_stmt *st = NULL;
+    char dir_name[128] = "";
+    if (db_prepare("SELECT dir_name FROM backup_record WHERE id=?1", &st) != 0) {
+        snprintf(err, errsz, "读取备份记录失败");
+        return -2;
+    }
+    db_bind_i64(st, 1, backup_id);
+    if (sqlite3_step(st) != SQLITE_ROW) {
+        sqlite3_finalize(st);
+        snprintf(err, errsz, "备份不存在");
+        return -1;
+    }
+    snprintf(dir_name, sizeof(dir_name), "%s", db_col_text(st, 0));
+    sqlite3_finalize(st);
+    if (!dir_name[0] || !path_is_safe(dir_name) || strchr(dir_name, '/')) {
+        snprintf(err, errsz, "备份名称非法");
+        return -2;
+    }
+    for (const char *p = dir_name; *p; p++) {
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'z') ||
+              (*p >= 'A' && *p <= 'Z') || *p == '_' || *p == '-' || *p == '.')) {
+            snprintf(err, errsz, "备份名称非法");
+            return -2;
+        }
+    }
+
+    char *dir_path = path_join(g_cfg.backup_dir, dir_name);
+    char *db_path = path_join(dir_path, "roomcheck.db");
+    char *uploads_path = path_join(dir_path, "uploads");
+    char *manifest_path = path_join(dir_path, "manifest.json");
+    int rc = -2;
+    if (!file_exists(db_path) || !is_dir(uploads_path) || !file_exists(manifest_path)) {
+        snprintf(err, errsz, "备份文件不完整");
+        goto done;
+    }
+    if (verify_backup_database(db_path, uploads_path, err, errsz) != 0)
+        goto done;
+
+    char *manifest_text = NULL;
+    size_t manifest_len = 0;
+    if (file_read(manifest_path, &manifest_text, &manifest_len) != 0) {
+        snprintf(err, errsz, "读取备份清单失败");
+        goto done;
+    }
+    jval_t *manifest = json_parse(manifest_text, manifest_len);
+    free(manifest_text);
+    if (!manifest) {
+        snprintf(err, errsz, "备份清单损坏");
+        goto done;
+    }
+    const char *database_name = json_get_str(manifest, "database");
+    const char *database_sha_field = json_get_str(manifest, "database_sha256");
+    int image_files = json_get_int(manifest, "image_files", -1);
+    char database_sha[80] = "";
+    if (database_sha_field)
+        snprintf(database_sha, sizeof(database_sha), "%s", database_sha_field);
+    int manifest_ok = database_name && strcmp(database_name, "roomcheck.db") == 0 &&
+                      database_sha[0] && strlen(database_sha) == 64 && image_files >= 0;
+    json_free(manifest);
+    if (!manifest_ok) {
+        snprintf(err, errsz, "备份清单内容不完整");
+        goto done;
+    }
+
+    char *db_data = NULL;
+    size_t db_len = 0;
+    if (file_read(db_path, &db_data, &db_len) != 0) {
+        snprintf(err, errsz, "读取备份数据库失败");
+        goto done;
+    }
+    char db_sha[65];
+    rc_sha256_hex(db_data, db_len, db_sha);
+    free(db_data);
+    if (!str_ieq(db_sha, database_sha)) {
+        snprintf(err, errsz, "备份数据库校验失败");
+        goto done;
+    }
+    if (count_files(uploads_path) != image_files) {
+        snprintf(err, errsz, "备份图片文件不完整");
+        goto done;
+    }
+
+    int64_t total = tree_size(dir_path);
+    if (total > 0)
+        sb_reserve(out, (size_t)total + 4096);
+    if (tar_add_file(out, "manifest.json", manifest_path, err, errsz) != 0)
+        goto done;
+    if (tar_add_file(out, "roomcheck.db", db_path, err, errsz) != 0)
+        goto done;
+    if (tar_add_tree(out, uploads_path, "uploads", err, errsz) != 0)
+        goto done;
+    static const char end_blocks[1024] = {0};
+    sb_putn(out, end_blocks, sizeof(end_blocks));
+    snprintf(file_name, fname_sz, "%s.tar", dir_name);
+    rc = 0;
+
+done:
+    if (rc != 0)
+        sb_reset(out);
+    free(dir_path);
+    free(db_path);
+    free(uploads_path);
+    free(manifest_path);
+    return rc;
+}
+
 static int restore_copy_snapshot(const char *snapshot_dir, char *err, size_t errsz)
 {
     char *snap_db = path_join(snapshot_dir, "roomcheck.db");
@@ -421,6 +711,10 @@ int backup_restore(int64_t backup_id, char *err, size_t errsz)
     if (ok && db_init(g_cfg.db_path) != 0) {
         ok = 0;
         snprintf(err, errsz, "重新打开数据库失败");
+    }
+    if (ok && auth_ensure_super_admin() != 0) {
+        ok = 0;
+        snprintf(err, errsz, "恢复后校验超级管理员失败");
     }
     if (ok) {
         sqlite3_stmt *del = NULL;

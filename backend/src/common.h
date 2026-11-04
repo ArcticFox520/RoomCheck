@@ -123,6 +123,8 @@ int rc_iso_week(int64_t week_start, int *iso_year, int *iso_week);
 void rc_fmt_datetime(int64_t ts, char *out, size_t outsz);
 void rc_fmt_date(int64_t ts, char *out, size_t outsz);
 void rc_fmt_time(int64_t ts, char *out, size_t outsz);
+void rc_fmt_month_day(int64_t ts, char *out, size_t outsz);
+void rc_fmt_week_range(int64_t week_start, int64_t week_end, char *out, size_t outsz);
 int rc_weekday(int day_index); /* day 0..6 -> 0=Sun..6=Sat */
 const char *rc_weekday_name(int day_index);
 int rc_day_is_check_day(int day_index); /* 0=Mon .. 6=Sun, Thu=3 forbidden */
@@ -254,6 +256,7 @@ typedef struct request {
 #define RF_AUTH 0x01
 #define RF_ADMIN 0x02
 #define RF_PUBLIC 0x04
+#define RF_SUPER_ADMIN 0x08
 
 typedef void (*handler_fn)(request_t *r);
 
@@ -318,6 +321,7 @@ typedef struct {
     char username[128];
     char display_name[128];
     int must_change_password;
+    int super_admin;
     char status[16];
     int64_t created_at;
     int64_t last_login_at;
@@ -338,6 +342,7 @@ int auth_login_allowed(const char *username, char *err_code, size_t code_sz,
 int auth_record_login_failure(const char *username);
 void auth_record_login_success(const char *username);
 int auth_ensure_admin(void);
+int auth_ensure_super_admin(void);
 void auth_set_session_cookie(request_t *r, const char *token, int64_t max_age);
 void auth_clear_session_cookie(request_t *r);
 void hash_session_token(const char *token, char out[65]);
@@ -409,6 +414,8 @@ void week_free(week_t *w);
 /* backup.c */
 int backup_run(const char *prefix, int keep, char *out_dir, size_t outsz, char *err, size_t errsz);
 int backup_restore(int64_t backup_id, char *err, size_t errsz);
+int backup_export_archive(int64_t backup_id, strbuf_t *out, char *file_name, size_t fname_sz,
+                          char *err, size_t errsz);
 int64_t backup_dir_size(const char *path);
 
 /* scheduler.c */
@@ -445,11 +452,19 @@ void h_admin_account_disable(request_t *r);
 void h_admin_account_delete(request_t *r);
 void h_admin_account_restore(request_t *r);
 void h_admin_account_week(request_t *r);
+void h_admin_admins(request_t *r);
+void h_admin_admin_create(request_t *r);
+void h_admin_admin_update(request_t *r);
+void h_admin_admin_enable(request_t *r);
+void h_admin_admin_disable(request_t *r);
+void h_admin_admin_delete(request_t *r);
+void h_admin_admin_restore(request_t *r);
 void h_admin_overview(request_t *r);
 void h_admin_logs(request_t *r);
 void h_admin_backups(request_t *r);
 void h_admin_backup_create(request_t *r);
 void h_admin_backup_restore(request_t *r);
+void h_admin_backup_export(request_t *r);
 void h_admin_orphans(request_t *r);
 
 /* helpers shared by handlers (api_common.c) */

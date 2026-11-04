@@ -39,7 +39,8 @@ static const char *k_schema =
     "  display_name TEXT NOT NULL DEFAULT '',"
     "  created_at INTEGER NOT NULL,"
     "  updated_at INTEGER NOT NULL,"
-    "  last_login_at INTEGER"
+    "  last_login_at INTEGER,"
+    "  super_admin INTEGER NOT NULL DEFAULT 0"
     ");"
 
     "CREATE TABLE IF NOT EXISTS floor_config ("
@@ -182,6 +183,23 @@ static const char *k_schema =
     "  value TEXT NOT NULL"
     ");";
 
+static int account_column_exists(const char *column)
+{
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    if (sqlite3_prepare_v2(g_db, "PRAGMA table_info(account)", -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *name = sqlite3_column_text(st, 1);
+        if (name && strcmp((const char *)name, column) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
 int db_init(const char *path)
 {
     db_mutex_ensure();
@@ -229,6 +247,18 @@ int db_init(const char *path)
         pthread_mutex_unlock(&g_db_mutex);
         return -1;
     }
+    int has_super_admin = account_column_exists("super_admin");
+    if (has_super_admin < 0 ||
+        (!has_super_admin &&
+         sqlite3_exec(g_db,
+                      "ALTER TABLE account ADD COLUMN super_admin INTEGER NOT NULL DEFAULT 0",
+                      NULL, NULL, NULL) != SQLITE_OK)) {
+        snprintf(g_db_error, sizeof(g_db_error), "数据库升级失败: %s", sqlite3_errmsg(g_db));
+        sqlite3_close(g_db);
+        g_db = NULL;
+        pthread_mutex_unlock(&g_db_mutex);
+        return -1;
+    }
     sqlite3_stmt *st = NULL;
     int version = 0;
     if (sqlite3_prepare_v2(g_db, "PRAGMA user_version", -1, &st, NULL) == SQLITE_OK) {
@@ -236,8 +266,8 @@ int db_init(const char *path)
             version = sqlite3_column_int(st, 0);
         sqlite3_finalize(st);
     }
-    if (version == 0)
-        sqlite3_exec(g_db, "PRAGMA user_version=1", NULL, NULL, NULL);
+    if (version < 2)
+        sqlite3_exec(g_db, "PRAGMA user_version=2", NULL, NULL, NULL);
     snprintf(g_db_error, sizeof(g_db_error), "ok");
     pthread_mutex_unlock(&g_db_mutex);
     return 0;

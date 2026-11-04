@@ -85,7 +85,8 @@ int account_json(jw_t *out, const account_t *a)
 
 int is_admin_request(request_t *r)
 {
-    return r && r->authed && strcmp(r->role, "admin") == 0;
+    return r && r->authed &&
+           (strcmp(r->role, "admin") == 0 || strcmp(r->role, "super_admin") == 0);
 }
 
 int room_permission(request_t *r, int64_t owner_account_id)

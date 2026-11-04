@@ -47,6 +47,20 @@ const route_t g_routes[] = {
      RF_AUTH | RF_ADMIN},
     {"GET", "/api/admin/orphans", h_admin_orphans, RF_AUTH | RF_ADMIN},
 
+    {"GET", "/api/super-admin/admins", h_admin_admins, RF_AUTH | RF_SUPER_ADMIN},
+    {"POST", "/api/super-admin/admins", h_admin_admin_create, RF_AUTH | RF_SUPER_ADMIN},
+    {"PATCH", "/api/super-admin/admins/:id", h_admin_admin_update, RF_AUTH | RF_SUPER_ADMIN},
+    {"POST", "/api/super-admin/admins/:id/enable", h_admin_admin_enable,
+     RF_AUTH | RF_SUPER_ADMIN},
+    {"POST", "/api/super-admin/admins/:id/disable", h_admin_admin_disable,
+     RF_AUTH | RF_SUPER_ADMIN},
+    {"POST", "/api/super-admin/admins/:id/delete", h_admin_admin_delete,
+     RF_AUTH | RF_SUPER_ADMIN},
+    {"POST", "/api/super-admin/admins/:id/restore", h_admin_admin_restore,
+     RF_AUTH | RF_SUPER_ADMIN},
+    {"GET", "/api/super-admin/backups/:id/download", h_admin_backup_export,
+     RF_AUTH | RF_SUPER_ADMIN},
+
     {NULL, NULL, NULL, 0}};
 
 const char *g_spa_routes[] = {"/", "/login", "/admin", "/manager", NULL};

@@ -112,14 +112,15 @@ static int process_deletion(int64_t account_id)
 
     char detail[512];
     snprintf(detail, sizeof(detail),
-             "72 天期满，永久删除楼层长 %s（账户 ID %lld）及其配置、排班、勾选、备注、图片",
+             "72 天期满，永久删除账户 %s（账户 ID %lld）及其全部关联数据",
              acct.username, (long long)account_id);
     int ok = 0;
     if (db_begin() == 0) {
         sqlite3_stmt *del = NULL;
         int deleted = 0;
-        if (db_prepare("DELETE FROM account WHERE id=?1 AND role='floor_manager' "
-                       "AND status='deleted' AND delete_at<=?2", &del) == 0) {
+        if (db_prepare("DELETE FROM account WHERE id=?1 AND role IN ('admin','floor_manager') "
+                       "AND super_admin=0 AND status='deleted' AND delete_at<=?2",
+                       &del) == 0) {
             db_bind_i64(del, 1, account_id);
             db_bind_i64(del, 2, rc_now());
             if (db_step_done(del) == 0)

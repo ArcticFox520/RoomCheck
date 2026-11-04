@@ -5,8 +5,9 @@
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
+-- super_admin = 1 且 role = 'admin' 表示超级管理员；role 列保存账户的基础角色。
 CREATE TABLE IF NOT EXISTS account (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     role                 TEXT NOT NULL CHECK (role IN ('admin', 'floor_manager')),
@@ -21,7 +22,8 @@ CREATE TABLE IF NOT EXISTS account (
     display_name         TEXT NOT NULL DEFAULT '',
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL,
-    last_login_at        INTEGER
+    last_login_at        INTEGER,
+    super_admin          INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS floor_config (

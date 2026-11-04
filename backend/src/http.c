@@ -637,8 +637,13 @@ static void handle_client(request_t *r)
             resp_error(r, 403, "password_change_required", "首次登录请先修改密码");
             return;
         }
-        if ((rt->flags & RF_ADMIN) && strcmp(r->role, "admin") != 0) {
+        if ((rt->flags & RF_ADMIN) && strcmp(r->role, "admin") != 0 &&
+            strcmp(r->role, "super_admin") != 0) {
             resp_error(r, 403, "forbidden", "需要管理员权限");
+            return;
+        }
+        if ((rt->flags & RF_SUPER_ADMIN) && strcmp(r->role, "super_admin") != 0) {
+            resp_error(r, 403, "forbidden", "需要超级管理员权限");
             return;
         }
         if (method_is_mutating(r->method)) {
